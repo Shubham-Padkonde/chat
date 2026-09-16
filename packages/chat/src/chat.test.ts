@@ -419,7 +419,7 @@ describe("Chat", () => {
       },
       {
         kind: "action",
-        direct: "fulfilled",
+        direct: "rejected",
         logMessage: "Action processing error",
         metadata: (suffix) => ({
           error: handlerError,
@@ -441,7 +441,7 @@ describe("Chat", () => {
       },
       {
         kind: "command",
-        direct: "void",
+        direct: "rejected",
         logMessage: "Slash command processing error",
         metadata: (suffix) => ({
           error: handlerError,
@@ -614,6 +614,26 @@ describe("Chat", () => {
   });
 
   describe("message deduplication", () => {
+    it("lets transports own deduplication when retrying admission", async () => {
+      const failure = new Error("Admission failed");
+      const handler = vi.fn().mockRejectedValueOnce(failure);
+      chat.onNewMention(handler);
+      const message = createTestMessage("retry", "Hey @slack-bot help");
+      const dispatch = () =>
+        chat.processMessage(mockAdapter, "slack:C123:1234.5678", message, {
+          deduplicate: false,
+        });
+
+      await expect(dispatch()).rejects.toBe(failure);
+      await dispatch();
+      expect(handler).toHaveBeenCalledTimes(2);
+      expect(mockState.setIfNotExists).not.toHaveBeenCalledWith(
+        "dedupe:slack:retry",
+        expect.anything(),
+        expect.anything()
+      );
+    });
+
     it("should skip duplicate messages with the same id", async () => {
       const handler = vi.fn().mockResolvedValue(undefined);
       chat.onNewMention(handler);

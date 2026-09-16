@@ -1750,6 +1750,209 @@ describe("TelegramAdapter", () => {
     expect(adapter.isPolling).toBe(false);
   });
 
+  it("waits for polled message processing and saves failures before acknowledging updates", async () => {
+    let settled = false;
+    let settleProcessing: (error?: Error) => void = () => {};
+    const processing = new Promise<void>((resolve, reject) => {
+      settleProcessing = (error?: Error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      };
+    });
+    mockFetch
+      .mockResolvedValueOnce(
+        telegramOk({
+          id: 999,
+          is_bot: true,
+          first_name: "Bot",
+          username: "mybot",
+        })
+      )
+      .mockResolvedValueOnce(telegramOk(true))
+      .mockResolvedValueOnce(
+        telegramOk([
+          {
+            update_id: 10,
+            message: sampleMessage({
+              message_id: 99,
+              text: "polled message",
+            }),
+          },
+        ])
+      )
+      .mockImplementation((_input, init) => {
+        return new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) {
+            reject(createAbortError());
+            return;
+          }
+          signal?.addEventListener(
+            "abort",
+            () => {
+              reject(createAbortError());
+            },
+            { once: true }
+          );
+        });
+      });
+
+    const adapter = createTelegramAdapter({
+      botToken: "token",
+      mode: "webhook",
+      logger: mockLogger,
+      userName: "mybot",
+    });
+    const processMessage = vi.fn(() => processing);
+    const chat = createMockChatInstance({
+      logger: mockLogger,
+      userName: "mybot",
+      overrides: { processMessage },
+    });
+
+    await adapter.initialize(chat);
+    await adapter.startPolling({
+      limit: 1,
+      timeout: 1,
+      allowedUpdates: ["message"],
+      retryDelayMs: 0,
+    });
+
+    try {
+      await waitForCondition(() => processMessage.mock.calls.length > 0);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      const pollCalls = () =>
+        mockFetch.mock.calls.filter(([input]) =>
+          String(input).includes("/getUpdates")
+        );
+      expect(pollCalls()).toHaveLength(1);
+
+      settleProcessing(new Error("Database admission failed"));
+      await waitForCondition(() => pollCalls().length >= 2);
+
+      const secondPollBody = JSON.parse(
+        String((pollCalls()[1]?.[1] as RequestInit).body)
+      ) as {
+        offset?: number;
+      };
+      expect(secondPollBody.offset).toBe(11);
+      expect(
+        await chat
+          .getState()
+          .get(
+            `telegram:polling:${createHash("sha256").update("999").digest("hex")}`
+          )
+      ).toMatchObject({
+        offset: 11,
+        pending: [
+          {
+            update: { update_id: 10 },
+            attempts: 1,
+            retryAt: expect.any(Number),
+          },
+        ],
+      });
+    } finally {
+      settleProcessing();
+      await adapter.stopPolling();
+    }
+  });
+
+  it("coalesces polled media groups before acknowledging updates", async () => {
+    vi.useFakeTimers();
+    mockFetch
+      .mockResolvedValueOnce(
+        telegramOk({
+          id: 999,
+          is_bot: true,
+          first_name: "Bot",
+          username: "mybot",
+        })
+      )
+      .mockResolvedValueOnce(telegramOk(true))
+      .mockResolvedValueOnce(
+        telegramOk([
+          {
+            update_id: 10,
+            message: sampleMessage({
+              message_id: 41,
+              media_group_id: "polled-album",
+              photo: [
+                {
+                  file_id: "photo-1",
+                  file_unique_id: "photo-unique-1",
+                  width: 800,
+                  height: 600,
+                },
+              ],
+              text: undefined,
+            }),
+          },
+          {
+            update_id: 11,
+            message: sampleMessage({
+              message_id: 42,
+              media_group_id: "polled-album",
+              photo: [
+                {
+                  file_id: "photo-2",
+                  file_unique_id: "photo-unique-2",
+                  width: 800,
+                  height: 600,
+                },
+              ],
+              text: undefined,
+            }),
+          },
+        ])
+      )
+      .mockImplementation((_input, init) => {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(createAbortError()),
+            { once: true }
+          );
+        });
+      });
+
+    const adapter = createTelegramAdapter({
+      botToken: "token",
+      mode: "webhook",
+      logger: mockLogger,
+      userName: "mybot",
+    });
+    const chat = createMockChat();
+
+    await adapter.initialize(chat);
+    await adapter.startPolling({ limit: 2, retryDelayMs: 0, timeout: 1 });
+
+    try {
+      await vi.advanceTimersByTimeAsync(2100);
+
+      const processMessage = chat.processMessage as ReturnType<typeof vi.fn>;
+      expect(processMessage).toHaveBeenCalledTimes(1);
+      expect(processMessage.mock.calls[0]?.[2].attachments).toHaveLength(2);
+
+      const pollCalls = mockFetch.mock.calls.filter(([input]) =>
+        String(input).includes("/getUpdates")
+      );
+      expect(
+        JSON.parse(String((pollCalls[1]?.[1] as RequestInit).body)).offset
+      ).toBe(12);
+    } finally {
+      await adapter.stopPolling();
+    }
+  });
+
   it("mode polling starts polling during initialize", async () => {
     mockFetch
       .mockResolvedValueOnce(
