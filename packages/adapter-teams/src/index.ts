@@ -831,6 +831,7 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
     let timer: ReturnType<typeof setTimeout> | undefined;
 
     const actionPromise = this.chat.processAction(actionEvent, {
+      ...webhookOptions,
       waitUntil: webhookOptions?.waitUntil ?? (() => {}),
       onOpenModal: async (modal, contextId) => {
         resolveModal({ modal, contextId });
