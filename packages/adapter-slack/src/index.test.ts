@@ -22,6 +22,7 @@ import type {
   Message,
   StateAdapter,
 } from "chat";
+import { Chat } from "chat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   SlackAdapterConfig,
@@ -37,6 +38,7 @@ import {
 import { incomingMessage } from "./test-fixtures";
 
 const FILE_ID_PATTERN = /^file-/;
+const ANY_TEXT_PATTERN = /./;
 
 // Captures guarded file downloads at the transport seam; the resolved
 // per-hop headers show which token (if any) each hop would send.
@@ -1151,6 +1153,68 @@ describe("parseMessage", () => {
     signingSecret: "test-secret",
     logger: mockLogger,
     botUserId: "U_BOT",
+  });
+
+  it("classifies the bot's mention without a user lookup", () => {
+    const section = (element: Record<string, unknown>) => [
+      {
+        type: "rich_text",
+        elements: [{ type: "rich_text_section", elements: [element] }],
+      },
+    ];
+    const base = {
+      type: "app_mention",
+      user: "U123",
+      channel: "C456",
+      text: "<@U_BOT> hi",
+      ts: "1234567890.123456",
+    };
+
+    const mention = adapter.parseMessage({
+      ...base,
+      blocks: section({ type: "user", user_id: "U_BOT" }),
+    });
+    const code = adapter.parseMessage({
+      ...base,
+      blocks: section({
+        type: "text",
+        text: "<@U_BOT> hi",
+        style: { code: true },
+      }),
+    });
+
+    expect(mention.isMention).toBe(true);
+    expect(code.isMention).toBe(false);
+  });
+
+  it("matches a structured user element regardless of bot id case", () => {
+    const lowercase = createSlackAdapter({
+      botToken: "xoxb-test-token",
+      signingSecret: "test-secret",
+      logger: mockLogger,
+      botUserId: "u_bot",
+    });
+
+    const message = lowercase.parseMessage({
+      type: "message",
+      user: "U123",
+      channel: "C456",
+      text: "<@U_BOT> hi",
+      ts: "1234567890.123456",
+      blocks: [
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [{ type: "user", user_id: "U_BOT" }],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(message.isMention).toBe(true);
   });
 
   it("parses a basic message event", () => {
@@ -4090,7 +4154,7 @@ describe("DM message handling", () => {
     );
   });
 
-  it("DM messages do NOT have isMention set (routed via onDirectMessage)", async () => {
+  it("DM messages without a bot mention report isMention false", async () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     // Capture the factory function to invoke it
@@ -4131,7 +4195,9 @@ describe("DM message handling", () => {
     const factory = (chatInstance.processMessage as ReturnType<typeof vi.fn>)
       .mock.calls[0][2];
     const message = await factory();
-    expect(message.isMention).toBeUndefined();
+    // The adapter inspected the content and found no bot mention, so the flag
+    // is a definitive false rather than undetermined.
+    expect(message.isMention).toBe(false);
   });
 
   it("USLACK system notifications in DMs are dispatched with isSystem set", async () => {
@@ -4181,7 +4247,7 @@ describe("DM message handling", () => {
     });
   });
 
-  it("channel messages do NOT have isMention auto-set", async () => {
+  it("channel messages without a bot mention report isMention false", async () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     chatInstance.processMessage = vi.fn();
@@ -4219,7 +4285,7 @@ describe("DM message handling", () => {
     const factory = (chatInstance.processMessage as ReturnType<typeof vi.fn>)
       .mock.calls[0][2];
     const message = await factory();
-    expect(message.isMention).toBeUndefined();
+    expect(message.isMention).toBe(false);
   });
 });
 
@@ -7292,6 +7358,45 @@ describe("resolveInlineMentions", () => {
     resolveInlineMentions(text: string): Promise<string>;
   }
 
+  /** Round-trip an event through the webhook and return the parsed message. */
+  async function parseIncoming(event: Record<string, unknown>) {
+    const state = createMockState();
+    const chatInstance = createMockChatInstance({ state });
+    chatInstance.processMessage = vi.fn();
+
+    const adapter = createSlackAdapter({
+      botToken: "xoxb-test-token",
+      signingSecret: secret,
+      logger: mockLogger,
+      botUserId: "U_BOT",
+    });
+
+    mockClientMethod(
+      adapter,
+      "users.info",
+      vi.fn().mockImplementation(async ({ user }: { user: string }) => ({
+        ok: true,
+        user: {
+          name: user === "U_BOT" ? "bot" : "user",
+          profile: { display_name: user === "U_BOT" ? "Test Bot" : "User" },
+        },
+      }))
+    );
+
+    await adapter.initialize(chatInstance);
+
+    const body = JSON.stringify({
+      type: "event_callback",
+      team_id: "T123",
+      event,
+    });
+    await adapter.handleWebhook(createWebhookRequest(body, secret));
+
+    const factory = (chatInstance.processMessage as ReturnType<typeof vi.fn>)
+      .mock.calls[0][2];
+    return factory();
+  }
+
   it("resolves user mentions in incoming messages via webhook", async () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
@@ -7464,6 +7569,487 @@ describe("resolveInlineMentions", () => {
     const message = await factory();
 
     expect(message.text).toBe("@Test Bot");
+    expect(message.isMention).toBe(true);
+  });
+
+  it("does not flag a bot id that only appears in inline code", async () => {
+    const message = await parseIncoming({
+      type: "app_mention",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "the app imports `<@U_BOT>/passport`",
+      ts: "1234567890.888888",
+      blocks: [
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [
+                { type: "text", text: "the app imports " },
+                {
+                  type: "text",
+                  text: "<@U_BOT>/passport",
+                  style: { code: true },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(message.isMention).toBe(false);
+  });
+
+  it("does not flag a code-styled user element", async () => {
+    // Slack stores a bot reference composed inside inline code as a `user`
+    // element carrying `style.code` (see sample-messages.md).
+    const message = await parseIncoming({
+      type: "app_mention",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "the app imports `<@U_BOT>/passport` and A &amp; B",
+      ts: "1234567890.888889",
+      blocks: [
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [
+                { type: "text", text: "the app imports " },
+                { type: "user", user_id: "U_BOT", style: { code: true } },
+                { type: "text", text: "/passport", style: { code: true } },
+                { type: "text", text: " and A & B" },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(message.isMention).toBe(false);
+  });
+
+  it("does not flag a bot id inside a preformatted block", async () => {
+    const message = await parseIncoming({
+      type: "app_mention",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "```\n<@U_BOT> is the bot\n```",
+      ts: "1234567890.999999",
+      blocks: [
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_preformatted",
+              elements: [{ type: "text", text: "<@U_BOT> is the bot" }],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(message.isMention).toBe(false);
+  });
+
+  it("flags a real mention when the same message also shows code", async () => {
+    const message = await parseIncoming({
+      type: "app_mention",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "<@U_BOT> run `<@U_BOT>/passport`",
+      ts: "1234567890.101010",
+      blocks: [
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [
+                { type: "user", user_id: "U_BOT" },
+                { type: "text", text: " run " },
+                {
+                  type: "text",
+                  text: "<@U_BOT>/passport",
+                  style: { code: true },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(message.isMention).toBe(true);
+  });
+
+  it("does not flag a bot id inside a code span when no blocks are present", async () => {
+    const message = await parseIncoming({
+      type: "message",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "run `<@U_BOT>` to invoke the bot",
+      ts: "1234567890.121212",
+    });
+
+    expect(message.isMention).toBe(false);
+  });
+
+  it("does not flag a bot id inside a fenced block when no blocks are present", async () => {
+    const message = await parseIncoming({
+      type: "message",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "```\n<@U_BOT>\n```",
+      ts: "1234567890.131313",
+    });
+
+    expect(message.isMention).toBe(false);
+  });
+
+  it("does not flag a literal bot name inside structured code", async () => {
+    const message = await parseIncoming({
+      type: "message",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "the docs say `@Example Bot`",
+      ts: "1234567890.141414",
+      blocks: [
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [
+                { type: "text", text: "the docs say " },
+                { type: "text", text: "@Example Bot", style: { code: true } },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(message.isMention).toBe(false);
+  });
+
+  it("does not flag an escaped bot id", async () => {
+    const message = await parseIncoming({
+      type: "message",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "the raw markup is &lt;@U_BOT&gt;",
+      ts: "1234567890.151515",
+    });
+
+    expect(message.isMention).toBe(false);
+  });
+
+  it("does not flag a bot id inside a code span in an attachment", async () => {
+    const message = await parseIncoming({
+      type: "message",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "",
+      ts: "1234567890.161616",
+      attachments: [{ mrkdwn_in: ["text"], text: "example: `<@U_BOT>`" }],
+    });
+
+    expect(message.isMention).toBe(false);
+  });
+
+  it("flags a bot mention in attachment mrkdwn", async () => {
+    const message = await parseIncoming({
+      type: "message",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "",
+      ts: "1234567890.171717",
+      attachments: [{ mrkdwn_in: ["text"], text: "hey <@U_BOT> take a look" }],
+    });
+
+    expect(message.isMention).toBe(true);
+  });
+
+  it("does not let unmarked fallback text override structured code", async () => {
+    const message = await parseIncoming({
+      type: "app_mention",
+      user: "U_SENDER",
+      channel: "C456",
+      // Slack's flattened fallback drops the code formatting, so the token
+      // looks like a mention even though the blocks say it is code.
+      text: "the app imports <@U_BOT>/passport",
+      ts: "1234567890.181818",
+      blocks: [
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [
+                { type: "text", text: "the app imports " },
+                {
+                  type: "text",
+                  text: "<@U_BOT>/passport",
+                  style: { code: true },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(message.isMention).toBe(false);
+  });
+
+  it("does not flag a bot id inside a raw_text table cell", async () => {
+    const message = await parseIncoming({
+      type: "message",
+      user: "U_SENDER",
+      channel: "C456",
+      // Slack's flattened fallback repeats the cell text, which is not a
+      // mention because a `raw_text` cell renders literally.
+      text: "Import <@U_BOT>/passport",
+      ts: "1234567890.191919",
+      blocks: [
+        {
+          type: "table",
+          rows: [
+            [
+              { type: "raw_text", text: "Import" },
+              { type: "raw_text", text: "<@U_BOT>/passport" },
+            ],
+          ],
+        },
+      ],
+    });
+
+    expect(message.isMention).toBe(false);
+    // The cell renders the way it is classified: as literal text.
+    expect(message.text).toContain("Import\t<@U_BOT>/passport");
+  });
+
+  it("does not flag a mention token in a rich-text text element", async () => {
+    const message = await parseIncoming({
+      type: "message",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "the app imports <@U_BOT>/passport",
+      ts: "1234567890.202021",
+      blocks: [
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [
+                { type: "text", text: "the app imports " },
+                { type: "text", text: "<@U_BOT>/passport" },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(message.isMention).toBe(false);
+  });
+
+  it("does not flag a mention token in a link label", async () => {
+    const message = await parseIncoming({
+      type: "message",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "<https://example.com|<@U_BOT>>",
+      ts: "1234567890.202022",
+      blocks: [
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [
+                {
+                  type: "link",
+                  url: "https://example.com",
+                  text: "<@U_BOT>",
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(message.isMention).toBe(false);
+  });
+
+  it("flags a bot mention in a mrkdwn section block", async () => {
+    const message = await parseIncoming({
+      type: "message",
+      user: "U_SENDER",
+      channel: "C456",
+      // Only the section block carries the mention, so the fallback text
+      // cannot be what satisfies this test.
+      text: "",
+      ts: "1234567890.202023",
+      blocks: [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text: "hey <@U_BOT> take a look" },
+        },
+      ],
+    });
+
+    expect(message.isMention).toBe(true);
+  });
+
+  it("does not flag a bot id in a plain_text section block", async () => {
+    const message = await parseIncoming({
+      type: "message",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "hey <@U_BOT> take a look",
+      ts: "1234567890.202024",
+      blocks: [
+        {
+          type: "section",
+          text: { type: "plain_text", text: "hey <@U_BOT> take a look" },
+        },
+      ],
+    });
+
+    expect(message.isMention).toBe(false);
+  });
+
+  it("does not read attachment fallback when the attachment has blocks", async () => {
+    const message = await parseIncoming({
+      type: "message",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "",
+      ts: "1234567890.202025",
+      attachments: [
+        {
+          fallback: "<@U_BOT> is the bot",
+          blocks: [
+            {
+              type: "rich_text",
+              elements: [
+                {
+                  type: "rich_text_preformatted",
+                  elements: [{ type: "text", text: "<@U_BOT>" }],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(message.isMention).toBe(false);
+  });
+
+  it("does not flag the bot's display name inside a text-only code span", async () => {
+    const message = await parseIncoming({
+      type: "message",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "the docs say `@Test Bot`",
+      ts: "1234567890.202020",
+    });
+
+    expect(message.isMention).toBe(false);
+  });
+
+  it("reports false for an ordinary message that never refers to the bot", async () => {
+    const message = await parseIncoming({
+      type: "message",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "hey <@U_OTHER> can you look?",
+      ts: "1234567890.202022",
+    });
+
+    expect(message.isMention).toBe(false);
+  });
+
+  it("trusts app_mention when the content never shows the known bot id", async () => {
+    // Enterprise Grid emits the bot's W… id in user elements while auth.test
+    // reported the U… id. Slack saw a mention, and no literal token explains
+    // the event, so the event stands.
+    const message = await parseIncoming({
+      type: "app_mention",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "<@W_BOT_GRID> help me",
+      ts: "1234567890.202023",
+      blocks: [
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [
+                { type: "user", user_id: "W_BOT_GRID" },
+                { type: "text", text: " help me" },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(message.isMention).toBe(true);
+  });
+
+  it("trusts app_mention when the bot id is unknown", async () => {
+    const state = createMockState();
+    const chatInstance = createMockChatInstance({ state });
+    chatInstance.processMessage = vi.fn();
+
+    const adapter = createSlackAdapter({
+      botToken: "xoxb-test-token",
+      signingSecret: secret,
+      logger: mockLogger,
+    });
+    mockClientMethod(
+      adapter,
+      "auth.test",
+      vi.fn().mockResolvedValue({ ok: true })
+    );
+    mockClientMethod(
+      adapter,
+      "users.info",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        user: { name: "bot", profile: { display_name: "Test Bot" } },
+      })
+    );
+    await adapter.initialize(chatInstance);
+
+    const body = JSON.stringify({
+      type: "event_callback",
+      team_id: "T123",
+      event: {
+        type: "app_mention",
+        user: "U_SENDER",
+        channel: "C456",
+        text: "<@U_BOT> help me",
+        ts: "1234567890.222222",
+      },
+    });
+    await adapter.handleWebhook(createWebhookRequest(body, secret));
+
+    const factory = (chatInstance.processMessage as ReturnType<typeof vi.fn>)
+      .mock.calls[0][2];
+    const message = await factory();
+
+    expect(adapter.botUserId).toBeUndefined();
     expect(message.isMention).toBe(true);
   });
 
@@ -7746,6 +8332,273 @@ describe("resolveInlineMentions", () => {
 
     // Should fall back to the channel ID
     expect(message.text).toContain("#CUNKNOWN");
+  });
+});
+
+// ============================================================================
+// Mention routing Tests
+// ============================================================================
+
+describe("mention routing", () => {
+  const secret = "test-signing-secret";
+
+  async function createRoutedBot(options: { botUserId?: string | null } = {}) {
+    const botUserId =
+      options.botUserId === undefined ? "U_BOT" : options.botUserId;
+    const state = createMockState();
+    const adapter = createSlackAdapter({
+      botToken: "xoxb-test-token",
+      signingSecret: secret,
+      logger: mockLogger,
+      userName: "Example Bot",
+      ...(botUserId ? { botUserId } : {}),
+    });
+    mockClientMethod(
+      adapter,
+      "auth.test",
+      vi
+        .fn()
+        .mockResolvedValue(
+          botUserId
+            ? { ok: true, user_id: botUserId, bot_id: "B_BOT" }
+            : { ok: true }
+        )
+    );
+    mockClientMethod(
+      adapter,
+      "users.info",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        user: { name: "bot", profile: { display_name: "Example Bot" } },
+      })
+    );
+
+    const bot = new Chat({
+      userName: "Example Bot",
+      adapters: { slack: adapter },
+      state,
+      logger: mockLogger,
+    });
+    await bot.initialize();
+    return { adapter, bot };
+  }
+
+  /** Deliver a webhook and wait for the Chat routing task to finish. */
+  async function deliverWebhook(
+    adapter: SlackAdapter,
+    event: Record<string, unknown>
+  ) {
+    const pending: Promise<unknown>[] = [];
+    await adapter.handleWebhook(
+      createWebhookRequest(
+        JSON.stringify({ type: "event_callback", team_id: "T123", event }),
+        secret
+      ),
+      { waitUntil: (task) => pending.push(task) }
+    );
+    await Promise.all(pending);
+  }
+
+  it("routes a code-only reference to message handlers, not mention handlers", async () => {
+    const { adapter, bot } = await createRoutedBot();
+    const mentionHandler = vi.fn();
+    const messageHandler = vi.fn();
+    bot.onNewMention(mentionHandler);
+    bot.onNewMessage(ANY_TEXT_PATTERN, messageHandler);
+
+    // The bot's display name is in the flattened text, so the SDK's text
+    // detection would otherwise route this message to the mention handler.
+    await deliverWebhook(adapter, {
+      type: "app_mention",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "the app imports `<@U_BOT>/passport`",
+      ts: "1234567890.202020",
+      blocks: [
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [
+                { type: "text", text: "the app imports " },
+                {
+                  type: "text",
+                  text: "<@U_BOT>/passport",
+                  style: { code: true },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(mentionHandler).not.toHaveBeenCalled();
+    expect(messageHandler).toHaveBeenCalled();
+  });
+
+  it("routes a real mention to mention handlers", async () => {
+    const { adapter, bot } = await createRoutedBot();
+    const mentionHandler = vi.fn();
+    bot.onNewMention(mentionHandler);
+
+    await deliverWebhook(adapter, {
+      type: "app_mention",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "<@U_BOT> help me",
+      ts: "1234567890.212121",
+      blocks: [
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [{ type: "user", user_id: "U_BOT" }],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(mentionHandler).toHaveBeenCalled();
+  });
+
+  it("routes a code-only reference with misleading fallback text to message handlers", async () => {
+    const { adapter, bot } = await createRoutedBot();
+    const mentionHandler = vi.fn();
+    const messageHandler = vi.fn();
+    bot.onNewMention(mentionHandler);
+    bot.onNewMessage(ANY_TEXT_PATTERN, messageHandler);
+
+    // The fallback `text` has no backticks, so it looks like a real mention;
+    // only the code-styled block element reveals it is literal.
+    await deliverWebhook(adapter, {
+      type: "app_mention",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "the app imports <@U_BOT>/passport",
+      ts: "1234567890.222222",
+      blocks: [
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [
+                { type: "text", text: "the app imports " },
+                {
+                  type: "text",
+                  text: "<@U_BOT>/passport",
+                  style: { code: true },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(mentionHandler).not.toHaveBeenCalled();
+    expect(messageHandler).toHaveBeenCalled();
+  });
+
+  it("routes a raw_text table cell reference to message handlers", async () => {
+    const { adapter, bot } = await createRoutedBot();
+    const mentionHandler = vi.fn();
+    const messageHandler = vi.fn();
+    bot.onNewMention(mentionHandler);
+    bot.onNewMessage(ANY_TEXT_PATTERN, messageHandler);
+
+    await deliverWebhook(adapter, {
+      type: "message",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "Import <@U_BOT>/passport",
+      ts: "1234567890.232323",
+      blocks: [
+        {
+          type: "table",
+          rows: [
+            [
+              { type: "raw_text", text: "Import" },
+              { type: "raw_text", text: "<@U_BOT>/passport" },
+            ],
+          ],
+        },
+      ],
+    });
+
+    expect(mentionHandler).not.toHaveBeenCalled();
+    expect(messageHandler).toHaveBeenCalled();
+  });
+
+  it("routes a text-only code reference to message handlers", async () => {
+    const { adapter, bot } = await createRoutedBot();
+    const mentionHandler = vi.fn();
+    const messageHandler = vi.fn();
+    bot.onNewMention(mentionHandler);
+    bot.onNewMessage(ANY_TEXT_PATTERN, messageHandler);
+
+    // No id markup at all: the configured name appears only inside a code span.
+    await deliverWebhook(adapter, {
+      type: "message",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "the docs say `@Example Bot`",
+      ts: "1234567890.242424",
+    });
+
+    expect(mentionHandler).not.toHaveBeenCalled();
+    expect(messageHandler).toHaveBeenCalled();
+  });
+
+  it("trusts app_mention when Slack reports an id the adapter does not know", async () => {
+    const { adapter, bot } = await createRoutedBot();
+    const mentionHandler = vi.fn();
+    bot.onNewMention(mentionHandler);
+
+    await deliverWebhook(adapter, {
+      type: "app_mention",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "<@W_BOT_GRID> help me",
+      ts: "1234567890.252524",
+      blocks: [
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [
+                { type: "user", user_id: "W_BOT_GRID" },
+                { type: "text", text: " help me" },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(mentionHandler).toHaveBeenCalled();
+  });
+
+  it("trusts app_mention when the bot id is unresolved", async () => {
+    const { adapter, bot } = await createRoutedBot({ botUserId: null });
+    const mentionHandler = vi.fn();
+    bot.onNewMention(mentionHandler);
+
+    await deliverWebhook(adapter, {
+      type: "app_mention",
+      user: "U_SENDER",
+      channel: "C456",
+      text: "<@U_BOT> help me",
+      ts: "1234567890.252525",
+    });
+
+    expect(adapter.botUserId).toBeUndefined();
+    expect(mentionHandler).toHaveBeenCalled();
   });
 });
 

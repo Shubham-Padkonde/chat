@@ -7,6 +7,7 @@ import {
   downloadAttachment,
   extractCard,
   extractFiles,
+  maskCodeSpans,
   NetworkError,
   replaceBareMentions,
   toBuffer,
@@ -547,8 +548,136 @@ export interface SlackThreadId {
 export interface SlackMessageBlock extends SlackBlock {
   elements?: SlackMessageBlock[];
   rows?: unknown;
+  /** `{ code: true }` marks an inline-code text element. */
+  style?: { code?: boolean };
   text?: string;
   url?: string;
+  user_id?: string;
+}
+
+/**
+ * Slack's user-mention syntax for `userId`: `<@U…>` or `<@U…|name>`. Used for
+ * mrkdwn content, where a mention is a token in the text.
+ */
+function mentionTokenPattern(userId: string): RegExp {
+  return new RegExp(`<@!?${escapeRegExp(userId)}(?:\\|[^>]*)?>`, "i");
+}
+
+/**
+ * The bot to look for, compiled once per message. `userId` is uppercased so
+ * a structured `user` element compares the way the case-insensitive token
+ * pattern matches.
+ */
+interface SlackMentionMatcher {
+  token: RegExp;
+  userId: string;
+}
+
+function mentionMatcher(userId: string): SlackMentionMatcher {
+  return { token: mentionTokenPattern(userId), userId: userId.toUpperCase() };
+}
+
+/**
+ * How a piece of content refers to the matched user: as a mention Slack
+ * renders, as a literal token (inside code or display text), or not at all.
+ * `literal` explains an `app_mention` event without making it an invocation;
+ * `none` leaves the event unexplained.
+ */
+type SlackMentionEvidence = "literal" | "mention" | "none";
+
+/** Classify a mrkdwn string, where code is carried as backticks. */
+function classifyMrkdwnMention(
+  text: string,
+  matcher: SlackMentionMatcher
+): SlackMentionEvidence {
+  if (!matcher.token.test(text)) {
+    return "none";
+  }
+  return matcher.token.test(maskCodeSpans(text)) ? "mention" : "literal";
+}
+
+/**
+ * Classify one legacy attachment part. Literal parts render only Slack
+ * control sequences, so a `<@U…>` token there is a mention; mrkdwn parts
+ * carry code as backticks.
+ */
+function classifyAttachmentPart(
+  part: SlackAttachmentPart,
+  matcher: SlackMentionMatcher
+): SlackMentionEvidence {
+  if ("mrkdwn" in part) {
+    return classifyMrkdwnMention(part.mrkdwn, matcher);
+  }
+  return matcher.token.test(part.literal) ? "mention" : "none";
+}
+
+/**
+ * Classify how blocks refer to the matched user.
+ *
+ * Slack renders a mention from a `user` element, and from a `<@U…>` token in a
+ * text object explicitly typed `mrkdwn`. A rich-text `text` element, a link
+ * label, and a `raw_text` table cell are display text: a token there stays
+ * literal. Inline code (`style.code`) and preformatted elements render
+ * literally too, whatever they hold.
+ *
+ * `blocktext` renders table cells from the same element types; the two must
+ * agree on which ones carry a mention, or `message.text` shows a mention the
+ * message is not classified as.
+ */
+function classifyBlocksMention(
+  blocks: SlackMessageBlock[],
+  matcher: SlackMentionMatcher
+): SlackMentionEvidence {
+  let literal = false;
+
+  const visit = (value: unknown, inCode: boolean): boolean => {
+    if (Array.isArray(value)) {
+      return value.some((item) => visit(item, inCode));
+    }
+    if (!isRecord(value)) {
+      return false;
+    }
+
+    const isCode =
+      inCode ||
+      value.type === "rich_text_preformatted" ||
+      (isRecord(value.style) && value.style.code === true);
+
+    if (
+      value.type === "user" &&
+      typeof value.user_id === "string" &&
+      value.user_id.toUpperCase() === matcher.userId
+    ) {
+      if (!isCode) {
+        return true;
+      }
+      literal = true;
+    } else if (
+      typeof value.text === "string" &&
+      matcher.token.test(value.text)
+    ) {
+      if (
+        !isCode &&
+        value.type === "mrkdwn" &&
+        matcher.token.test(maskCodeSpans(value.text))
+      ) {
+        return true;
+      }
+      literal = true;
+    }
+
+    return (
+      visit(value.elements, isCode) ||
+      visit(value.rows, isCode) ||
+      visit(value.fields, isCode) ||
+      visit(value.text, isCode)
+    );
+  };
+
+  if (blocks.some((block) => visit(block, false))) {
+    return "mention";
+  }
+  return literal ? "literal" : "none";
 }
 
 type SlackContentNode = FormattedContent["children"][number];
@@ -590,6 +719,11 @@ function blocktext(value: unknown): string {
 
   const text = str(value.text);
   switch (value.type) {
+    case "raw_text":
+      // A raw_text cell is plain text: Slack reserves mentions and links for
+      // rich_text cells, so its control characters render literally. Keep it
+      // aligned with `classifyBlocksMention`, which does not scan these cells.
+      return escapeSlackText(text ?? "");
     case "link": {
       const url = str(value.url);
       if (!url) {
@@ -760,6 +894,8 @@ type SlackAttachmentPart = { literal: string } | { mrkdwn: string };
 
 /** Renderable content of one attachment. */
 interface SlackAttachmentContent {
+  /** Structured content. When present, Slack renders only the blocks. */
+  blocks: SlackMessageBlock[];
   parts: SlackAttachmentPart[];
   tables: SlackTableData[];
 }
@@ -783,7 +919,8 @@ interface SlackAttachmentContent {
 function attachmentContent(
   attachment: NonNullable<SlackEvent["attachments"]>[number]
 ): SlackAttachmentContent {
-  const tables = (attachment.blocks ?? []).flatMap((block) => {
+  const blocks = attachment.blocks ?? [];
+  const tables = blocks.flatMap((block) => {
     const parsed = tableData(block);
     return parsed ? [parsed] : [];
   });
@@ -827,7 +964,7 @@ function attachmentContent(
     }
   }
 
-  return { parts, tables };
+  return { blocks, parts, tables };
 }
 
 function mentionIds(
@@ -3338,14 +3475,10 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
     // Node.js AsyncLocalStorage propagates context to async continuations as long as
     // the Promise is created within the run() callback. We call processMessage inside
     // run() so the async task and all its awaits inherit the context.
-    const isMention = event.type === "app_mention";
-    const makeFactory = (id: string) => async (): Promise<Message<unknown>> => {
-      const msg = await this.parseSlackMessage(event, id);
-      if (isMention) {
-        msg.isMention = true;
-      }
-      return msg;
-    };
+    // `app_mention` is not trusted on its own: Slack fires it for a bot id that
+    // only appears inside code, so parseSlackMessage decides from the content.
+    const makeFactory = (id: string) => async (): Promise<Message<unknown>> =>
+      this.parseSlackMessage(event, id);
 
     // Under agent_view each top-level DM message is its own thread root, which
     // would silently bypass subscriptions created on the conversation-scoped
@@ -4234,8 +4367,8 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
    * Resolve inline user mentions in Slack mrkdwn text.
    * Converts <@U123> to <@U123|displayName> so that toAst/extractPlainText
    * renders them as @displayName instead of @U123. The bot's own mention is
-   * decoded too — parseSlackMessage detects it from the raw event text and
-   * flags the message with `isMention`.
+   * decoded too: `detectSelfMention` classifies it from the event's blocks
+   * (or, without blocks, this text) before the id markup is replaced.
    */
   protected async resolveInlineMentions(text: string): Promise<string> {
     const userIds = new Set<string>();
@@ -4390,6 +4523,80 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
     };
   }
 
+  /**
+   * Whether the message invokes the bot.
+   *
+   * Slack fires `app_mention` for a bot id that only appears inside code, so the
+   * invocation is classified from the message content: a `user` element for the
+   * bot outside code, or a `<@U…>` token outside code in mrkdwn content, is a
+   * mention. Inline (`style.code`) and preformatted content renders literally,
+   * so a bot id there is not.
+   *
+   * Returns `true` for an invocation and `false` when the content refers to
+   * the bot only literally, or not at all on an ordinary message. An
+   * `app_mention` whose content never shows the known bot id is still trusted:
+   * Slack saw a mention under an id the adapter does not know, such as the
+   * `W…` form an Enterprise Grid workspace emits for a `U…` bot. Without any
+   * bot id, `app_mention` is trusted the same way and other messages stay
+   * undetermined for the SDK's text-based fallback.
+   */
+  protected detectSelfMention(
+    event: SlackEvent,
+    rawText: string,
+    attachments: SlackAttachmentContent[]
+  ): boolean | undefined {
+    const botUserId = this.botUserId;
+    if (!botUserId) {
+      return event.type === "app_mention" ? true : undefined;
+    }
+
+    const matcher = mentionMatcher(botUserId);
+    let literal = false;
+    const found = (evidence: SlackMentionEvidence): boolean => {
+      if (evidence === "literal") {
+        literal = true;
+      }
+      return evidence === "mention";
+    };
+
+    const blocks = event.blocks ?? [];
+    // Blocks model the message body. The flattened `text` field loses the
+    // code/literal distinction, so it is only consulted without them.
+    const body =
+      blocks.length > 0
+        ? classifyBlocksMention(blocks, matcher)
+        : classifyMrkdwnMention(rawText, matcher);
+    if (found(body)) {
+      return true;
+    }
+
+    for (const attachment of attachments) {
+      if (attachment.blocks.length > 0) {
+        // Structured attachment content is authoritative for that attachment,
+        // so its legacy fallback cannot add mention evidence.
+        if (found(classifyBlocksMention(attachment.blocks, matcher))) {
+          return true;
+        }
+        continue;
+      }
+
+      for (const part of attachment.parts) {
+        if (found(classifyAttachmentPart(part, matcher))) {
+          return true;
+        }
+      }
+    }
+
+    if (event.type === "app_mention" && !literal) {
+      return true;
+    }
+
+    // Slack mentions are user-id tokens. With the content inspected, the
+    // absence of one is a definitive non-mention, so a display name in plain or
+    // code-styled text cannot fall through to the SDK's name matching.
+    return false;
+  }
+
   protected async parseSlackMessage(
     event: SlackEvent,
     threadId: string
@@ -4434,27 +4641,14 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
       }
     }
 
-    // Resolve inline @mentions to display names. The bot's own mention is
-    // decoded like any other, so detect it here from the raw event text —
-    // after resolution the ID markup is gone, and detectMention's username
-    // pattern cannot reliably match the bot's resolved display name.
-    const text = await this.resolveInlineMentions(rawText);
-    const formatted = await this.resolvedContent(event, text);
-    const { userIds } = mentionIds(
-      eventTables(event),
-      authorAttachments(event).map(attachmentContent)
-    );
+    // Classify the bot's own mention from the raw event before resolution
+    // replaces the id markup with display names.
+    const attachments = authorAttachments(event).map(attachmentContent);
+    const isMention = this.detectSelfMention(event, rawText, attachments);
 
-    const botUserId = this.botUserId;
-    const selfMentionPattern = botUserId
-      ? new RegExp(
-          `<@!?${escapeRegExp(botUserId)}(?:\\|[^>]*)?>|(?<!\\w)@${escapeRegExp(botUserId)}(?![\\w-])`,
-          "i"
-        )
-      : undefined;
-    const isSelfMentioned = Boolean(
-      selfMentionPattern?.test(rawText) || (botUserId && userIds.has(botUserId))
-    );
+    // Resolve inline @mentions to display names.
+    const text = await this.resolveInlineMentions(rawText);
+    const formatted = await this.resolvedContent(event, text, attachments);
 
     return new Message({
       id: event.ts || "",
@@ -4462,7 +4656,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
       text: toPlainText(formatted),
       formatted,
       raw: event,
-      isMention: isSelfMentioned || undefined,
+      isMention,
       author: {
         userId:
           event.user || event.bot_profile?.user_id || event.bot_id || "unknown",
@@ -6725,7 +6919,11 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
     const isMe = this.isMessageFromSelf(event);
 
     const text = event.text || "";
-    const formatted = this.content(event, text);
+    const attachments = authorAttachments(event).map(attachmentContent);
+    // Classify the mention the same way the async path does, so an edit's
+    // pre-edit snapshot cannot disagree with the edited message about it.
+    const isMention = this.detectSelfMention(event, text, attachments);
+    const formatted = this.content(event, text, attachments);
     // Without async lookup, fall back to user ID for human users
     const userName = event.username || event.user || "unknown";
     const fullName = event.username || event.user || "unknown";
@@ -6736,6 +6934,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
       text: toPlainText(formatted),
       formatted,
       raw: event,
+      isMention,
       author: {
         userId:
           event.user || event.bot_profile?.user_id || event.bot_id || "unknown",
@@ -6759,13 +6958,15 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
     });
   }
 
-  protected content(event: SlackEvent, text: string): FormattedContent {
+  protected content(
+    event: SlackEvent,
+    text: string,
+    attachments = authorAttachments(event).map(attachmentContent)
+  ): FormattedContent {
     return this.assembleContent(
       text,
       eventTables(event),
-      authorAttachments(event).flatMap((attachment) =>
-        this.attachmentNodes(attachmentContent(attachment))
-      )
+      attachments.flatMap((attachment) => this.attachmentNodes(attachment))
     );
   }
 
@@ -6777,10 +6978,10 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
    */
   protected async resolvedContent(
     event: SlackEvent,
-    text: string
+    text: string,
+    attachments = authorAttachments(event).map(attachmentContent)
   ): Promise<FormattedContent> {
     const { leading, trailing } = eventTables(event);
-    const attachments = authorAttachments(event).map(attachmentContent);
     const { channelIds, userIds } = mentionIds(
       { leading, trailing },
       attachments
@@ -6806,6 +7007,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
       },
       attachments.flatMap((attachment) =>
         this.attachmentNodes({
+          ...attachment,
           parts: attachment.parts.map(resolvePart),
           tables: attachment.tables.map(resolveTable),
         })
