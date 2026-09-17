@@ -3192,7 +3192,9 @@ export class Chat<
       return;
     }
 
-    // Backward compat: treat DMs as mentions when no DM handlers registered
+    // Backward compat: treat DMs as mentions when no DM handlers registered.
+    // This is a routing rule, not a detection result, so it deliberately
+    // overrides an adapter's `false`: every DM is addressed to the bot.
     if (isDM) {
       message.isMention = true;
     }
@@ -3259,13 +3261,17 @@ export class Chat<
     message: Message,
     context?: MessageContext
   ): boolean {
+    // An adapter that reads the platform's own mention metadata reports a
+    // definitive boolean. Fall back to text detection only when it reports
+    // nothing, so a known non-mention is not re-derived from flattened text
+    // (where code samples and quoted text can look like a mention).
     message.isMention =
-      message.isMention || this.detectMention(adapter, message);
+      message.isMention ?? this.detectMention(adapter, message);
 
     let hasMention = message.isMention === true;
     for (const skipped of context?.skipped ?? []) {
       skipped.isMention =
-        skipped.isMention || this.detectMention(adapter, skipped);
+        skipped.isMention ?? this.detectMention(adapter, skipped);
       hasMention = hasMention || skipped.isMention === true;
     }
 
