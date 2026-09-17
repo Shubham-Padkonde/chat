@@ -6072,3 +6072,222 @@ describe("Chat", () => {
     });
   });
 });
+
+describe("Chat initialization retry (#922)", () => {
+  it("does not restart an initialized adapter when another adapter fails", async () => {
+    const ready = createMockAdapter("ready");
+    const failing = createMockAdapter("failing");
+    const state = createMockState();
+    const failed = new Error("Adapter unavailable");
+    let active = 0;
+    ready.initialize = vi.fn(async () => {
+      active++;
+    });
+    ready.disconnect = vi.fn(async () => {
+      active--;
+    });
+    failing.initialize = vi
+      .fn()
+      .mockRejectedValueOnce(failed)
+      .mockResolvedValue(undefined);
+    const chat = new Chat({
+      userName: "testbot",
+      adapters: { ready, failing },
+      state,
+      logger: mockLogger,
+    });
+
+    try {
+      await expect(chat.initialize()).rejects.toBe(failed);
+      const results = await Promise.allSettled([
+        chat.initialize(),
+        chat.webhooks.ready(new Request("https://example.com")),
+      ]);
+
+      expect(ready.initialize).toHaveBeenCalledOnce();
+      expect(failing.initialize).toHaveBeenCalledOnce();
+      expect(state.connect).toHaveBeenCalledOnce();
+      expect(ready.handleWebhook).not.toHaveBeenCalled();
+      expect(results).toEqual([
+        { status: "rejected", reason: failed },
+        { status: "rejected", reason: failed },
+      ]);
+    } finally {
+      await chat.shutdown();
+    }
+    expect(active).toBe(0);
+    await chat.initialize();
+    expect(ready.initialize).toHaveBeenCalledTimes(2);
+    await chat.shutdown();
+    expect(active).toBe(0);
+  });
+
+  it("does not overlap adapter initialization after a sibling fails", async () => {
+    const slow = createMockAdapter("slow");
+    const failing = createMockAdapter("failing");
+    const state = createMockState();
+    const failed = new Error("Adapter unavailable");
+    let release = () => {};
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    slow.initialize = vi.fn(() => pending);
+    failing.initialize = vi
+      .fn()
+      .mockRejectedValueOnce(failed)
+      .mockResolvedValue(undefined);
+    const chat = new Chat({
+      userName: "testbot",
+      adapters: { slow, failing },
+      state,
+      logger: mockLogger,
+    });
+
+    await expect(chat.initialize()).rejects.toBe(failed);
+    const retry = Promise.allSettled([chat.initialize()]);
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(slow.initialize).toHaveBeenCalledOnce();
+      expect(failing.initialize).toHaveBeenCalledOnce();
+    } finally {
+      release();
+      await retry;
+      await chat.shutdown();
+    }
+    expect(await retry).toEqual([{ status: "rejected", reason: failed }]);
+  });
+
+  it("recovers through a webhook after repeated state connection failures", async () => {
+    const adapter = createMockAdapter("slack");
+    const state = createMockState();
+    const failed = new Error("State unavailable");
+    state.connect = vi
+      .fn()
+      .mockRejectedValueOnce(failed)
+      .mockRejectedValueOnce(failed)
+      .mockResolvedValue(undefined);
+    const chat = new Chat({
+      userName: "testbot",
+      adapters: { slack: adapter },
+      state,
+      logger: mockLogger,
+    });
+
+    await expect(chat.initialize()).rejects.toBe(failed);
+    await expect(
+      chat.webhooks.slack(new Request("https://example.com"))
+    ).rejects.toBe(failed);
+    expect(adapter.initialize).not.toHaveBeenCalled();
+    expect(adapter.handleWebhook).not.toHaveBeenCalled();
+
+    const response = await chat.webhooks.slack(
+      new Request("https://example.com")
+    );
+    expect(response.status).toBe(200);
+    await chat.initialize();
+    expect(state.connect).toHaveBeenCalledTimes(3);
+    expect(adapter.initialize).toHaveBeenCalledOnce();
+    expect(adapter.handleWebhook).toHaveBeenCalledOnce();
+    await chat.shutdown();
+  });
+
+  it("keeps a newer attempt when a pre-shutdown state connection rejects", async () => {
+    const state = createMockState();
+    let reject = (_error: Error) => {};
+    let resolve = () => {};
+    const previous = new Promise<void>((_resolve, rejectConnection) => {
+      reject = rejectConnection;
+    });
+    const current = new Promise<void>((resolveConnection) => {
+      resolve = resolveConnection;
+    });
+    state.connect = vi
+      .fn()
+      .mockReturnValueOnce(previous)
+      .mockReturnValue(current);
+    const chat = new Chat({
+      userName: "testbot",
+      adapters: {},
+      state,
+      logger: mockLogger,
+    });
+    const failed = new Error("Old connection failed");
+    const first = expect(chat.initialize()).rejects.toBe(failed);
+    await chat.shutdown();
+    const second = chat.initialize();
+    reject(failed);
+    await first;
+    const third = chat.initialize();
+    expect(state.connect).toHaveBeenCalledTimes(2);
+    resolve();
+    await Promise.all([second, third]);
+    await chat.shutdown();
+  });
+
+  it("retries initialization after a failed attempt once the state recovers", async () => {
+    const mockAdapter = createMockAdapter("slack");
+    const mockState = createMockState();
+    const refused = Object.assign(new Error("connect ECONNREFUSED"), {
+      code: "ECONNREFUSED",
+    });
+    mockState.connect = vi
+      .fn()
+      .mockRejectedValueOnce(refused)
+      .mockResolvedValue(undefined);
+
+    const chat = new Chat({
+      userName: "testbot",
+      adapters: { slack: mockAdapter },
+      state: mockState,
+      logger: mockLogger,
+    });
+
+    await expect(chat.initialize()).rejects.toBe(refused);
+    // The adapters were never reached by the failed attempt.
+    expect(mockAdapter.initialize).not.toHaveBeenCalled();
+
+    // Redis is back: the next call must try again instead of replaying the
+    // rejected promise.
+    await expect(chat.initialize()).resolves.toBeUndefined();
+    expect(mockState.connect).toHaveBeenCalledTimes(2);
+    expect(mockAdapter.initialize).toHaveBeenCalledTimes(1);
+
+    // Once initialized, further calls are no-ops.
+    await chat.initialize();
+    expect(mockState.connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("still shares one attempt between concurrent callers, including a failing one", async () => {
+    const mockAdapter = createMockAdapter("slack");
+    const mockState = createMockState();
+    let rejectConnect: (error: Error) => void = () => {};
+    mockState.connect = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((_, reject) => {
+            rejectConnect = reject;
+          })
+      )
+      .mockResolvedValue(undefined);
+
+    const chat = new Chat({
+      userName: "testbot",
+      adapters: { slack: mockAdapter },
+      state: mockState,
+      logger: mockLogger,
+    });
+
+    const first = chat.initialize();
+    const second = chat.initialize();
+    expect(mockState.connect).toHaveBeenCalledTimes(1);
+
+    const refused = new Error("connect ECONNREFUSED");
+    rejectConnect(refused);
+    await expect(first).rejects.toBe(refused);
+    await expect(second).rejects.toBe(refused);
+
+    await expect(chat.initialize()).resolves.toBeUndefined();
+    expect(mockState.connect).toHaveBeenCalledTimes(2);
+  });
+});
