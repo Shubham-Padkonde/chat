@@ -89,7 +89,7 @@ Run all unit tests across every package in a single Vitest Workspace run:
 pnpm test:workspace
 ```
 
-This produces one combined report covering all 11 unit-test packages. Integration tests (`@chat-adapter/integration-tests`) are excluded since they require platform credentials.
+This produces one combined report covering the unit-test packages and example tests. The integration-test package and PostgreSQL's real-database suite are excluded; run those through their package test commands.
 
 You can also run tests per-package via Turborepo:
 
@@ -156,6 +156,10 @@ To preview docs locally:
 ```bash
 pnpm --filter docs dev
 ```
+
+### Writing with AI coding agents
+
+If an AI coding agent writes any of your contribution's prose, it must use the [`technical-writer` skill](../.agents/skills/technical-writer/SKILL.md). That covers docs pages, READMEs, changesets, commit messages, PR descriptions, and issues. The skill sets the voice and editorial standards for this repo and checks technical claims against the source. Agents that read this repo's `AGENTS.md` pick up the requirement automatically.
 
 ## Preview Branch Testing
 

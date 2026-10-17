@@ -6223,18 +6223,6 @@ describe("getUser", () => {
   });
 });
 
-describe("subclass extensibility", () => {
-  it("exposes protected members and methods to subclasses", () => {
-    class TestSubclass extends TelegramAdapter {
-      checkAccess() {
-        // Compile-time check: if any of these revert to `private`, this fails to type-check.
-        return [this.logger, this.formatConverter, this.processUpdate] as const;
-      }
-    }
-    expect(TestSubclass.prototype.checkAccess).toBeInstanceOf(Function);
-  });
-});
-
 describe("sleep abort support", () => {
   class SleepTestAdapter extends TelegramAdapter {
     sleepFor(delayMs: number, signal?: AbortSignal): Promise<void> {
@@ -6570,6 +6558,7 @@ describe("mentionOnReply", () => {
     mentionOnReply?: boolean;
     replyFromBot: boolean;
     fromBot?: boolean;
+    isTopicMessage?: boolean;
     messageThreadId?: number;
     replyToMessageId?: number;
   }) {
@@ -6609,6 +6598,7 @@ describe("mentionOnReply", () => {
             ...(options.messageThreadId === undefined
               ? {}
               : { message_thread_id: options.messageThreadId }),
+            ...(options.isTopicMessage ? { is_topic_message: true } : {}),
             ...(options.fromBot
               ? {
                   from: {
@@ -6677,6 +6667,7 @@ describe("mentionOnReply", () => {
     const parsed = await deliverReply({
       mentionOnReply: true,
       replyFromBot: true,
+      isTopicMessage: true,
       messageThreadId: 5,
       replyToMessageId: 5,
     });
@@ -6687,8 +6678,23 @@ describe("mentionOnReply", () => {
     const parsed = await deliverReply({
       mentionOnReply: true,
       replyFromBot: true,
+      isTopicMessage: true,
       messageThreadId: 5,
       replyToMessageId: 42,
+    });
+    expect(parsed?.isMention).toBe(true);
+  });
+
+  it("counts a reply to the bot in a regular supergroup reply thread", async () => {
+    // Outside forums, Telegram sets message_thread_id on a reply to the id of
+    // the message it answers (a reply thread) and omits is_topic_message. That
+    // reply must still count, even though message_thread_id equals
+    // reply_to_message.message_id.
+    const parsed = await deliverReply({
+      mentionOnReply: true,
+      replyFromBot: true,
+      messageThreadId: 5,
+      replyToMessageId: 5,
     });
     expect(parsed?.isMention).toBe(true);
   });

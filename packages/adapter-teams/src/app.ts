@@ -12,7 +12,7 @@ import { Client as GraphClient } from "@microsoft/teams.graph";
 import type { TeamsThreadId } from "./types";
 
 /** Bot Framework service URLs are compared and sent without a trailing slash. */
-export function normalizeServiceUrl(serviceUrl: string): string {
+function normalizeServiceUrl(serviceUrl: string): string {
   let end = serviceUrl.length;
   while (end > 0 && serviceUrl[end - 1] === "/") {
     end--;

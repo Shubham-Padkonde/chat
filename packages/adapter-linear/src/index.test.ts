@@ -1,5 +1,6 @@
 import type { AsyncLocalStorage } from "node:async_hooks";
 import { createHmac } from "node:crypto";
+import { ValidationError } from "@chat-adapter/shared";
 import {
   connectWebhookContract,
   createMockChatInstance,
@@ -7,7 +8,13 @@ import {
   createMockState,
   threadIdContract,
 } from "@chat-adapter/tests";
-import type { LinearClient } from "@linear/sdk";
+import {
+  InvalidInputLinearError,
+  type LinearClient,
+  RatelimitedLinearError,
+} from "@linear/sdk";
+import { Chat } from "chat";
+import { createChatTools } from "chat/ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   LinearAgentSessionCommentRawMessage,
@@ -20,6 +27,7 @@ import { createLinearAdapter, LinearAdapter } from "./index";
 const WEBHOOK_SECRET = "test-webhook-secret";
 const BYTES_32_PATTERN = /32 bytes/;
 const NO_LINEAR_TOKEN_PATTERN = /No Linear access token available/;
+const ISSUE_UUID = "2174add1-f7c8-44e3-bbf3-2d60b5ea8bc9";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -2077,12 +2085,491 @@ describe("postMessage", () => {
 // editMessage
 // =============================================================================
 
+describe.each([
+  "edit",
+  "delete",
+  "reaction",
+] as const)("%s comment ownership", (operation) => {
+  const mutate = (
+    adapter: LinearAdapter,
+    threadId: string,
+    messageId: string
+  ) => {
+    if (operation === "edit") {
+      return adapter.editMessage(threadId, messageId, "Updated");
+    }
+    if (operation === "delete") {
+      return adapter.deleteMessage(threadId, messageId);
+    }
+    return adapter.addReaction(threadId, messageId, "thumbs_up");
+  };
+
+  const setup = (comment: {
+    id: string;
+    issueId?: string;
+    parentId?: string;
+  }) => {
+    const adapter = createWebhookAdapter();
+    setDefaultOrganizationId(adapter, "org-123");
+    const client = {
+      comment: vi.fn().mockResolvedValue(comment),
+      updateComment: vi.fn().mockResolvedValue({
+        comment: {
+          ...comment,
+          body: "Updated",
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      }),
+      deleteComment: vi.fn().mockResolvedValue({ success: true }),
+      createReaction: vi.fn().mockResolvedValue({ success: true }),
+    };
+    setDefaultClient(adapter, client);
+    return { adapter, client };
+  };
+
+  it.each([
+    { id: "comment-1", issueId: "private-issue" },
+    { id: "comment-1" },
+    { id: "comment-1", issueId: "issue-123", parentId: "sibling-root" },
+    { id: "comment-1", issueId: "issue-123" },
+  ])("rejects a foreign or unverifiable comment: %j", async (comment) => {
+    const { adapter, client } = setup(comment);
+    await expect(
+      mutate(adapter, "linear:issue-123:c:root", "comment-1")
+    ).rejects.toThrow(ValidationError);
+    expect(client.updateComment).not.toHaveBeenCalled();
+    expect(client.deleteComment).not.toHaveBeenCalled();
+    expect(client.createReaction).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["linear:issue-123", { id: "comment-1", issueId: "issue-123" }],
+    ["linear:issue-123:c:root", { id: "root", issueId: "issue-123" }],
+    [
+      "linear:issue-123:c:root",
+      { id: "comment-1", issueId: "issue-123", parentId: "root" },
+    ],
+  ] as const)("allows a comment in %s", async (threadId, comment) => {
+    const { adapter, client } = setup(comment);
+    await mutate(adapter, threadId, comment.id);
+    expect(client.comment).toHaveBeenCalledWith({ id: comment.id });
+    const mutation =
+      operation === "edit" ? client.updateComment : client.deleteComment;
+    if (operation === "reaction") {
+      expect(client.createReaction).toHaveBeenCalledWith(
+        expect.objectContaining({ commentId: comment.id })
+      );
+    } else {
+      expect(mutation).toHaveBeenCalled();
+    }
+  });
+
+  it("does not mutate after a failed lookup", async () => {
+    const { adapter, client } = setup({
+      id: "comment-1",
+      issueId: "issue-123",
+    });
+    client.comment.mockRejectedValue(new Error("Lookup failed"));
+    await expect(
+      mutate(adapter, "linear:issue-123", "comment-1")
+    ).rejects.toThrow("Lookup failed");
+    expect(client.updateComment).not.toHaveBeenCalled();
+    expect(client.deleteComment).not.toHaveBeenCalled();
+    expect(client.createReaction).not.toHaveBeenCalled();
+  });
+
+  it("preserves agent-session mutation rules", async () => {
+    const { adapter, client } = setup({
+      id: "comment-1",
+      issueId: "issue-123",
+    });
+    const result = mutate(adapter, "linear:issue-123:s:session", "comment-1");
+    if (operation === "reaction") {
+      await result;
+      expect(client.createReaction).toHaveBeenCalled();
+    } else {
+      await expect(result).rejects.toThrow("append-only");
+      expect(client.comment).not.toHaveBeenCalled();
+    }
+  });
+
+  it("blocks a foreign comment through the scoped public tool", async () => {
+    const { adapter, client } = setup({
+      id: "comment-1",
+      issueId: "private-issue",
+    });
+    const chat = new Chat({
+      userName: "test-bot",
+      adapters: { linear: adapter },
+      state: createMockState(),
+      logger: createMockLogger(),
+    });
+    await chat.initialize();
+    try {
+      const tools = createChatTools({
+        chat,
+        scope: "linear:issue-123",
+        strictScope: true,
+        requireApproval: false,
+      });
+      const input = {
+        threadId: "linear:issue-123",
+        messageId: "comment-1",
+        message: "Updated",
+        emoji: "thumbs_up",
+      };
+      const options = { toolCallId: "ownership", messages: [] };
+      const tool =
+        operation === "edit" ? tools.editMessage : tools.deleteMessage;
+      const result =
+        operation === "reaction"
+          ? tools.addReaction?.execute?.(input, options)
+          : tool?.execute?.(input, options);
+      await expect(result).rejects.toThrow(
+        "Comment does not belong to this thread"
+      );
+      expect(client.updateComment).not.toHaveBeenCalled();
+      expect(client.deleteComment).not.toHaveBeenCalled();
+      expect(client.createReaction).not.toHaveBeenCalled();
+    } finally {
+      await chat.shutdown();
+    }
+  });
+});
+
+describe("SDK comment ownership", () => {
+  it.each([
+    ["linear:issue-123", "issue-123", null, true],
+    ["linear:issue-123", "private-issue", null, false],
+    ["linear:issue-123", null, null, false],
+    ["linear:issue-123:c:comment-1", "issue-123", null, true],
+    ["linear:issue-123:c:root", "issue-123", "root", true],
+    ["linear:issue-123:c:root", "issue-123", "sibling", false],
+    ["linear:issue-123:c:root", "issue-123", null, false],
+  ] as const)("checks SDK ownership in %s with issue %s and parent %s", async (threadId, issueId, parentId, allowed) => {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        const request = JSON.parse(String(init.body)) as { query: string };
+        if (request.query.includes("mutation")) {
+          calls.push("delete");
+          return Response.json({
+            data: { commentDelete: { success: true, lastSyncId: "0" } },
+          });
+        }
+        calls.push("lookup");
+        return Response.json({
+          data: {
+            comment: {
+              id: "comment-1",
+              issueId,
+              parentId,
+              body: "Private content",
+              reactions: [],
+              createdAt: "2026-10-13T00:00:00.000Z",
+              updatedAt: "2026-10-13T00:00:00.000Z",
+            },
+          },
+        });
+      })
+    );
+    const adapter = createLinearAdapter({
+      apiKey: "test",
+      webhookSecret: WEBHOOK_SECRET,
+      apiUrl: "https://api.linear.test/graphql",
+      logger: createMockLogger(),
+    });
+    const result = adapter.deleteMessage(threadId, "comment-1");
+    if (allowed) {
+      await result;
+      expect(calls).toEqual(["lookup", "delete"]);
+    } else {
+      await expect(result).rejects.toThrow(
+        "Comment does not belong to this thread"
+      );
+      expect(calls).toEqual(["lookup"]);
+    }
+  });
+});
+
+describe.each([
+  "edit",
+  "delete",
+  "reaction",
+] as const)("%s comment ownership with issue identifiers", (operation) => {
+  const mutate = (
+    adapter: LinearAdapter,
+    threadId: string,
+    messageId: string
+  ) => {
+    if (operation === "edit") {
+      return adapter.editMessage(threadId, messageId, "Updated");
+    }
+    if (operation === "delete") {
+      return adapter.deleteMessage(threadId, messageId);
+    }
+    return adapter.addReaction(threadId, messageId, "thumbs_up");
+  };
+
+  const setup = (resolvedIssueId: string) => {
+    const adapter = createWebhookAdapter();
+    setDefaultOrganizationId(adapter, "org-123");
+    const comment = { id: "comment-1", issueId: ISSUE_UUID };
+    const client = {
+      comment: vi.fn().mockResolvedValue(comment),
+      issue: vi.fn().mockResolvedValue({ id: resolvedIssueId }),
+      updateComment: vi.fn().mockResolvedValue({
+        comment: {
+          ...comment,
+          body: "Updated",
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      }),
+      deleteComment: vi.fn().mockResolvedValue({ success: true }),
+      createReaction: vi.fn().mockResolvedValue({ success: true }),
+    };
+    setDefaultClient(adapter, client);
+    const mutation = {
+      edit: client.updateComment,
+      delete: client.deleteComment,
+      reaction: client.createReaction,
+    }[operation];
+    return { adapter, client, mutation };
+  };
+
+  it("allows a comment whose issue resolves to the thread identifier", async () => {
+    const { adapter, client, mutation } = setup(ISSUE_UUID);
+    await mutate(adapter, "linear:ENG-123", "comment-1");
+    expect(client.issue).toHaveBeenCalledWith("ENG-123");
+    expect(mutation).toHaveBeenCalled();
+  });
+
+  it("rejects a comment whose issue resolves to a different identifier", async () => {
+    const { adapter, client, mutation } = setup(
+      "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+    );
+    await expect(
+      mutate(adapter, "linear:ENG-123", "comment-1")
+    ).rejects.toThrowError(
+      new ValidationError("linear", "Comment does not belong to this thread")
+    );
+    expect(client.issue).toHaveBeenCalledWith("ENG-123");
+    expect(mutation).not.toHaveBeenCalled();
+  });
+
+  it("rejects a thread identifier that does not exist", async () => {
+    const { adapter, client, mutation } = setup(ISSUE_UUID);
+    client.issue.mockRejectedValue(
+      new InvalidInputLinearError({ message: "Entity not found: Issue" }, [])
+    );
+    await expect(
+      mutate(adapter, "linear:ENG-999", "comment-1")
+    ).rejects.toThrowError(
+      new ValidationError("linear", "Comment does not belong to this thread")
+    );
+    expect(mutation).not.toHaveBeenCalled();
+  });
+
+  it("allows a mixed-case UUID thread without resolving the issue", async () => {
+    const { adapter, client, mutation } = setup(ISSUE_UUID);
+    await mutate(adapter, `linear:${ISSUE_UUID.toUpperCase()}`, "comment-1");
+    expect(client.issue).not.toHaveBeenCalled();
+    expect(mutation).toHaveBeenCalled();
+  });
+
+  it("maps a missing comment to a ValidationError", async () => {
+    const { adapter, mutation } = setup(ISSUE_UUID);
+    (adapter as unknown as { defaultClient: unknown }).defaultClient = {
+      ...(adapter as unknown as { defaultClient: object }).defaultClient,
+      comment: vi
+        .fn()
+        .mockRejectedValue(
+          new InvalidInputLinearError(
+            { message: "Entity not found: Comment" },
+            []
+          )
+        ),
+    };
+    await expect(
+      mutate(adapter, "linear:issue-123", "comment-1")
+    ).rejects.toThrowError(
+      new ValidationError("linear", "Comment does not belong to this thread")
+    );
+    expect(mutation).not.toHaveBeenCalled();
+  });
+
+  it("propagates lookup errors other than not found", async () => {
+    const { adapter, client, mutation } = setup(ISSUE_UUID);
+    const rateLimit = new RatelimitedLinearError(
+      { message: "Rate limit exceeded" },
+      []
+    );
+    client.comment.mockRejectedValue(rateLimit);
+    await expect(mutate(adapter, "linear:issue-123", "comment-1")).rejects.toBe(
+      rateLimit
+    );
+    expect(mutation).not.toHaveBeenCalled();
+  });
+});
+
+describe("SDK comment lookup errors", () => {
+  const stubLinearError = (type: string, message: string, status = 200) => {
+    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
+      Response.json(
+        {
+          data: null,
+          errors: [
+            {
+              message,
+              path: ["comment"],
+              extensions: { type, userError: true },
+            },
+          ],
+        },
+        { status }
+      )
+    );
+    vi.stubGlobal("fetch", fetch);
+    return fetch;
+  };
+
+  const createSdkAdapter = () =>
+    createLinearAdapter({
+      apiKey: "test",
+      webhookSecret: WEBHOOK_SECRET,
+      apiUrl: "https://api.linear.test/graphql",
+      logger: createMockLogger(),
+    });
+
+  it("maps a missing comment to a ValidationError before mutating", async () => {
+    const fetch = stubLinearError("invalid input", "Entity not found: Comment");
+    await expect(
+      createSdkAdapter().deleteMessage("linear:issue-123", "comment-1")
+    ).rejects.toThrowError(
+      new ValidationError("linear", "Comment does not belong to this thread")
+    );
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("maps a missing root comment to a ValidationError when fetching", async () => {
+    stubLinearError("invalid input", "Entity not found: Comment");
+    await expect(
+      createSdkAdapter().fetchMessages("linear:issue-123:c:comment-1")
+    ).rejects.toThrowError(
+      new ValidationError("linear", "Comment does not belong to this issue")
+    );
+  });
+
+  it("propagates rate limit errors unchanged", async () => {
+    const fetch = stubLinearError("ratelimited", "Rate limit exceeded", 400);
+    await expect(
+      createSdkAdapter().deleteMessage("linear:issue-123", "comment-1")
+    ).rejects.toBeInstanceOf(RatelimitedLinearError);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("streamAsComment", () => {
+  it("edits its own comment without ownership lookups", async () => {
+    const adapter = createWebhookAdapter();
+    setDefaultOrganizationId(adapter, "org-123");
+    const comment = {
+      id: "stream-comment",
+      issueId: "issue-123",
+      body: "...",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      url: "https://linear.app/test/comment/stream-comment",
+    };
+    const client = {
+      comment: vi.fn(),
+      issue: vi.fn(),
+      createComment: vi.fn().mockResolvedValue({
+        comment: Promise.resolve(comment),
+      }),
+      updateComment: vi.fn().mockResolvedValue({
+        comment: Promise.resolve(comment),
+      }),
+    };
+    setDefaultClient(adapter, client);
+
+    async function* chunks() {
+      for (const chunk of ["Hello", " there", " world"]) {
+        yield chunk;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+
+    await adapter.stream("linear:issue-123", chunks(), {
+      updateIntervalMs: 5,
+    });
+
+    expect(client.updateComment.mock.calls.length).toBeGreaterThan(1);
+    expect(client.updateComment).toHaveBeenLastCalledWith("stream-comment", {
+      body: "Hello there world",
+    });
+    expect(client.comment).not.toHaveBeenCalled();
+    expect(client.issue).not.toHaveBeenCalled();
+  });
+});
+
+describe("fetchMessages with issue identifiers", () => {
+  const setup = (resolvedIssueId: string) => {
+    const adapter = createWebhookAdapter();
+    setDefaultOrganizationId(adapter, "org-123");
+    const client = {
+      comment: vi.fn().mockResolvedValue({
+        id: "root-comment",
+        issueId: ISSUE_UUID,
+        body: "Root comment",
+        botActor: { id: "bot-user-id", name: "Test Bot" },
+        createdAt: new Date("2025-06-01T10:00:00.000Z"),
+        updatedAt: new Date("2025-06-01T10:00:00.000Z"),
+      }),
+      issue: vi.fn().mockResolvedValue({ id: resolvedIssueId }),
+      comments: vi.fn().mockResolvedValue({
+        nodes: [],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    };
+    setDefaultClient(adapter, client);
+    return { adapter, client };
+  };
+
+  it("fetches a comment thread addressed by issue identifier", async () => {
+    const { adapter, client } = setup(ISSUE_UUID);
+    const result = await adapter.fetchMessages("linear:ENG-123:c:root-comment");
+    expect(client.issue).toHaveBeenCalledWith("ENG-123");
+    expect(result.messages.map((message) => message.text)).toEqual([
+      "Root comment",
+    ]);
+    expect(result.messages[0].threadId).toBe(
+      `linear:${ISSUE_UUID}:c:root-comment`
+    );
+  });
+
+  it("rejects a comment thread whose identifier resolves elsewhere", async () => {
+    const { adapter, client } = setup("a1b2c3d4-e5f6-7890-abcd-ef1234567890");
+    await expect(
+      adapter.fetchMessages("linear:ENG-123:c:root-comment")
+    ).rejects.toThrowError(
+      new ValidationError("linear", "Comment does not belong to this issue")
+    );
+    expect(client.comments).not.toHaveBeenCalled();
+  });
+});
+
 describe("editMessage", () => {
   it("should update comment via linearClient.updateComment", async () => {
     const adapter = createWebhookAdapter();
     setDefaultOrganizationId(adapter, "org-123");
     const mockComment = {
       id: "edited-comment-1",
+      issueId: "issue-123",
+      parentId: "parent-comment",
       body: "Updated body",
       createdAt: new Date("2025-06-01T12:00:00.000Z"),
       updatedAt: new Date("2025-06-01T13:00:00.000Z"),
@@ -2093,9 +2580,13 @@ describe("editMessage", () => {
     });
     (
       adapter as unknown as {
-        linearClient: { updateComment: typeof mockUpdateComment };
+        linearClient: {
+          updateComment: typeof mockUpdateComment;
+          comment: ReturnType<typeof vi.fn>;
+        };
       }
     ).linearClient = {
+      comment: vi.fn().mockResolvedValue(mockComment),
       updateComment: mockUpdateComment,
     } as never;
 
@@ -2122,9 +2613,15 @@ describe("editMessage", () => {
     });
     (
       adapter as unknown as {
-        linearClient: { updateComment: typeof mockUpdateComment };
+        linearClient: {
+          updateComment: typeof mockUpdateComment;
+          comment: ReturnType<typeof vi.fn>;
+        };
       }
     ).linearClient = {
+      comment: vi
+        .fn()
+        .mockResolvedValue({ id: "comment-1", issueId: "issue-123" }),
       updateComment: mockUpdateComment,
     } as never;
 
@@ -2144,9 +2641,15 @@ describe("deleteMessage", () => {
     const mockDeleteComment = vi.fn().mockResolvedValue({});
     (
       adapter as unknown as {
-        linearClient: { deleteComment: typeof mockDeleteComment };
+        linearClient: {
+          deleteComment: typeof mockDeleteComment;
+          comment: ReturnType<typeof vi.fn>;
+        };
       }
     ).linearClient = {
+      comment: vi
+        .fn()
+        .mockResolvedValue({ id: "comment-to-delete", issueId: "issue-123" }),
       deleteComment: mockDeleteComment,
     } as never;
 
@@ -2166,9 +2669,15 @@ describe("addReaction", () => {
     const mockCreateReaction = vi.fn().mockResolvedValue({});
     (
       adapter as unknown as {
-        linearClient: { createReaction: typeof mockCreateReaction };
+        linearClient: {
+          createReaction: typeof mockCreateReaction;
+          comment: ReturnType<typeof vi.fn>;
+        };
       }
     ).linearClient = {
+      comment: vi
+        .fn()
+        .mockResolvedValue({ id: "comment-1", issueId: "issue-123" }),
       createReaction: mockCreateReaction,
     } as never;
 
@@ -2185,9 +2694,15 @@ describe("addReaction", () => {
     const mockCreateReaction = vi.fn().mockResolvedValue({});
     (
       adapter as unknown as {
-        linearClient: { createReaction: typeof mockCreateReaction };
+        linearClient: {
+          createReaction: typeof mockCreateReaction;
+          comment: ReturnType<typeof vi.fn>;
+        };
       }
     ).linearClient = {
+      comment: vi
+        .fn()
+        .mockResolvedValue({ id: "comment-1", issueId: "issue-123" }),
       createReaction: mockCreateReaction,
     } as never;
 
@@ -2206,9 +2721,15 @@ describe("addReaction", () => {
     const mockCreateReaction = vi.fn().mockResolvedValue({});
     (
       adapter as unknown as {
-        linearClient: { createReaction: typeof mockCreateReaction };
+        linearClient: {
+          createReaction: typeof mockCreateReaction;
+          comment: ReturnType<typeof vi.fn>;
+        };
       }
     ).linearClient = {
+      comment: vi
+        .fn()
+        .mockResolvedValue({ id: "comment-1", issueId: "issue-123" }),
       createReaction: mockCreateReaction,
     } as never;
 
@@ -2225,9 +2746,15 @@ describe("addReaction", () => {
     const mockCreateReaction = vi.fn().mockResolvedValue({});
     (
       adapter as unknown as {
-        linearClient: { createReaction: typeof mockCreateReaction };
+        linearClient: {
+          createReaction: typeof mockCreateReaction;
+          comment: ReturnType<typeof vi.fn>;
+        };
       }
     ).linearClient = {
+      comment: vi
+        .fn()
+        .mockResolvedValue({ id: "comment-1", issueId: "issue-123" }),
       createReaction: mockCreateReaction,
     } as never;
 
@@ -2351,7 +2878,10 @@ describe("fetchMessages", () => {
     expect(result.nextCursor).toBeUndefined();
   });
 
-  it("should fetch comment thread (root + children) when commentId present", async () => {
+  it.each([
+    "forward",
+    "backward",
+  ] as const)("should fetch a same-issue comment thread in %s order", async (direction) => {
     const adapter = createWebhookAdapter();
     setDefaultOrganizationId(adapter, "org-xyz");
     const mockUser = {
@@ -2361,6 +2891,7 @@ describe("fetchMessages", () => {
     };
     const mockRootComment = {
       id: "root-comment",
+      issueId: "issue-abc",
       body: "Root comment",
       userId: "user-1",
       createdAt: new Date("2025-06-01T10:00:00.000Z"),
@@ -2372,6 +2903,8 @@ describe("fetchMessages", () => {
       nodes: [
         {
           id: "child-1",
+          issueId: "issue-abc",
+          parentId: "root-comment",
           body: "Reply",
           userId: "user-1",
           createdAt: new Date("2025-06-01T11:00:00.000Z"),
@@ -2380,7 +2913,7 @@ describe("fetchMessages", () => {
           user: Promise.resolve(mockUser),
         },
       ],
-      pageInfo: { hasNextPage: false, endCursor: null },
+      pageInfo: { hasNextPage: true, endCursor: "next-page" },
     };
     const mockLinearClient = {
       comment: vi.fn().mockResolvedValue(mockRootComment),
@@ -2391,7 +2924,8 @@ describe("fetchMessages", () => {
     ).linearClient = mockLinearClient as never;
 
     const result = await adapter.fetchMessages(
-      "linear:issue-abc:c:root-comment"
+      "linear:issue-abc:c:root-comment",
+      { direction, limit: 10 }
     );
 
     expect(mockLinearClient.comment).toHaveBeenCalledWith({
@@ -2401,12 +2935,220 @@ describe("fetchMessages", () => {
       filter: {
         parent: { id: { eq: "root-comment" } },
       },
-      last: 50,
+      ...(direction === "forward" ? { first: 10 } : { last: 10 }),
     });
     // Root comment + 1 child
     expect(result.messages).toHaveLength(2);
     expect(result.messages[0].text).toBe("Root comment");
     expect(result.messages[1].text).toBe("Reply");
+    expect(result.messages.map((message) => message.threadId)).toEqual([
+      "linear:issue-abc:c:root-comment",
+      "linear:issue-abc:c:child-1",
+    ]);
+    expect(
+      result.messages.map((message) => message.raw.comment.issueId)
+    ).toEqual(["issue-abc", "issue-abc"]);
+    expect(result.nextCursor).toBe("next-page");
+  });
+
+  it.each([
+    "issue-private",
+    undefined,
+    null,
+    "",
+  ])("rejects a comment thread with an unverified issueId: %s", async (issueId) => {
+    const adapter = createWebhookAdapter();
+    setDefaultOrganizationId(adapter, "org-xyz");
+    const user = vi.fn().mockResolvedValue({
+      id: "user-1",
+      name: "Test User",
+      displayName: "Test User",
+    });
+    const comment = {
+      id: "private-comment",
+      issueId,
+      body: "Private issue content",
+      userId: "user-1",
+      createdAt: new Date("2025-06-01T10:00:00.000Z"),
+      updatedAt: new Date("2025-06-01T10:00:00.000Z"),
+      get user() {
+        return user();
+      },
+    };
+    const client = {
+      comment: vi.fn().mockResolvedValue(comment),
+      comments: vi.fn().mockResolvedValue({
+        nodes: [],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    };
+    setDefaultClient(adapter, client);
+    const parse = vi.spyOn(adapter, "parseMessage");
+
+    await expect(
+      adapter.fetchMessages("linear:issue-public:c:private-comment")
+    ).rejects.toThrowError(
+      new ValidationError("linear", "Comment does not belong to this issue")
+    );
+    expect(client.comment).toHaveBeenCalledWith({ id: "private-comment" });
+    expect(client.comments).not.toHaveBeenCalled();
+    expect(user).not.toHaveBeenCalled();
+    expect(parse).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "issue-private",
+    null,
+    "issue-public",
+  ])("validates comment ownership through the Linear SDK: %s", async (issueId) => {
+    const adapter = createWebhookAdapter();
+    setDefaultOrganizationId(adapter, "org-xyz");
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(
+        Response.json({
+          data: {
+            comment: {
+              id: "comment-1",
+              issueId,
+              body: "Comment content",
+              createdAt: "2025-06-01T10:00:00.000Z",
+              updatedAt: "2025-06-01T10:00:00.000Z",
+              reactions: [],
+              reactionData: [],
+              botActor: { id: "bot-user-id", name: "Test Bot" },
+            },
+          },
+        })
+      )
+      .mockResolvedValueOnce(
+        Response.json({
+          data: {
+            comments: {
+              nodes: [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        })
+      );
+    vi.stubGlobal("fetch", fetch);
+
+    const result = adapter.fetchMessages("linear:issue-public:c:comment-1");
+
+    if (issueId === "issue-public") {
+      await expect(result).resolves.toMatchObject({
+        messages: [
+          {
+            text: "Comment content",
+            threadId: "linear:issue-public:c:comment-1",
+          },
+        ],
+      });
+      expect(fetch).toHaveBeenCalledTimes(2);
+    } else {
+      await expect(result).rejects.toThrowError(
+        new ValidationError("linear", "Comment does not belong to this issue")
+      );
+      expect(fetch).toHaveBeenCalledTimes(1);
+    }
+    expect(fetch.mock.calls[0][1]?.body).toContain("issueId");
+  });
+
+  describe.each([
+    "linear:issue-public:s:private-session",
+    "linear:issue-public:c:source-comment:s:private-session",
+  ])("agent session ownership for %s", (thread) => {
+    it.each([
+      "issue-private",
+      undefined,
+      null,
+      "",
+    ])("rejects an unverified issueId before loading content: %s", async (issueId) => {
+      const adapter = createWebhookAdapter();
+      const comment = vi.fn().mockResolvedValue(undefined);
+      const activities = vi.fn().mockResolvedValue({
+        nodes: [],
+        pageInfo: {},
+      });
+      const client = {
+        agentSession: vi.fn().mockResolvedValue({
+          id: "private-session",
+          issueId,
+          get comment() {
+            return comment();
+          },
+          activities,
+        }),
+        comments: vi.fn(),
+      };
+      setDefaultClient(adapter, client);
+
+      await expect(adapter.fetchMessages(thread)).rejects.toThrowError(
+        new ValidationError(
+          "linear",
+          "Agent session does not belong to this issue"
+        )
+      );
+      expect(client.agentSession).toHaveBeenCalledWith("private-session");
+      expect(comment).not.toHaveBeenCalled();
+      expect(client.comments).not.toHaveBeenCalled();
+      expect(activities).not.toHaveBeenCalled();
+    });
+  });
+
+  it.each([
+    "issue-private",
+    null,
+    "issue-public",
+  ])("validates agent session ownership through the Linear SDK: %s", async (issueId) => {
+    const adapter = createWebhookAdapter();
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(
+        Response.json({
+          data: {
+            agentSession: {
+              id: "session-1",
+              issue: issueId ? { id: issueId } : null,
+              comment: null,
+              externalLinks: [],
+              externalUrls: [],
+              createdAt: "2025-06-01T10:00:00.000Z",
+              updatedAt: "2025-06-01T10:00:00.000Z",
+            },
+          },
+        })
+      )
+      .mockResolvedValueOnce(
+        Response.json({
+          data: {
+            agentSession: {
+              activities: {
+                nodes: [],
+                pageInfo: { hasPreviousPage: false, startCursor: null },
+              },
+            },
+          },
+        })
+      );
+    vi.stubGlobal("fetch", fetch);
+
+    const result = adapter.fetchMessages("linear:issue-public:s:session-1");
+    if (issueId === "issue-public") {
+      await expect(result).resolves.toEqual({
+        messages: [],
+        nextCursor: undefined,
+      });
+      expect(fetch).toHaveBeenCalledTimes(2);
+    } else {
+      await expect(result).rejects.toThrowError(
+        new ValidationError(
+          "linear",
+          "Agent session does not belong to this issue"
+        )
+      );
+      expect(fetch).toHaveBeenCalledTimes(1);
+    }
   });
 
   it("should fetch agent session threads as visible comments only", async () => {
@@ -2612,12 +3354,7 @@ describe("fetchMessages", () => {
     expect(mockLinearClient.comment).toHaveBeenCalledWith({
       id: "nonexistent",
     });
-    expect(mockLinearClient.comments).toHaveBeenCalledWith({
-      filter: {
-        parent: { id: { eq: "nonexistent" } },
-      },
-      last: 50,
-    });
+    expect(mockLinearClient.comments).not.toHaveBeenCalled();
   });
 
   it("should pass limit option to API", async () => {
@@ -3206,12 +3943,15 @@ describe("runtime operations", () => {
 
     const mockComment = {
       id: "edited-comment-1",
+      issueId: "issue-123",
+      parentId: "parent-comment",
       body: "Updated body",
       createdAt: new Date("2025-06-01T12:00:00.000Z"),
       updatedAt: new Date("2025-06-01T13:00:00.000Z"),
       url: "https://linear.app/test/comment/edited-comment-1",
     };
     const mockClient = {
+      comment: vi.fn().mockResolvedValue(mockComment),
       updateComment: vi.fn().mockResolvedValue({
         comment: Promise.resolve(mockComment),
       }),
@@ -3233,6 +3973,9 @@ describe("runtime operations", () => {
   it("deleteMessage and addReaction use the current client", async () => {
     const adapter = createWebhookAdapter();
     const mockClient = {
+      comment: vi
+        .fn()
+        .mockResolvedValue({ id: "comment-1", issueId: "issue-123" }),
       deleteComment: vi.fn().mockResolvedValue(undefined),
       createReaction: vi.fn().mockResolvedValue(undefined),
     };
@@ -4504,21 +5247,5 @@ describe("fetchSubject", () => {
 
     const result = await adapter.fetchSubject(raw as unknown);
     expect(result).toBeNull();
-  });
-});
-
-describe("subclass extensibility", () => {
-  it("exposes protected members and methods to subclasses", () => {
-    class TestSubclass extends LinearAdapter {
-      checkAccess() {
-        // Compile-time check: if any of these revert to `private`, this fails to type-check.
-        return [
-          this.logger,
-          this.formatConverter,
-          this.handleCommentCreated,
-        ] as const;
-      }
-    }
-    expect(TestSubclass.prototype.checkAccess).toBeInstanceOf(Function);
   });
 });

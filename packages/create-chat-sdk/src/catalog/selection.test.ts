@@ -1,11 +1,10 @@
-import { ADAPTER_NAMES, getAdapter } from "chat/adapters";
+import { ADAPTER_NAMES, getAdapter } from "@chat-adapter/catalog";
 import { describe, expect, it } from "vitest";
 import { CLI_SCAFFOLD_SPEC, getCliScaffoldSpec } from "./scaffold-spec.js";
 import {
   defaultStateAdapter,
   resolveAdapterSelection,
   resolveAdapterValue,
-  stateAdapterOptions,
 } from "./selection.js";
 
 describe("CLI_SCAFFOLD_SPEC", () => {
@@ -69,11 +68,5 @@ describe("resolveAdapterSelection", () => {
 describe("state adapter helpers", () => {
   it("returns memory as the default state adapter", () => {
     expect(defaultStateAdapter()).toBe(getAdapter("memory"));
-  });
-
-  it("returns only state adapter options", () => {
-    expect(
-      stateAdapterOptions().every((adapter) => adapter.type === "state")
-    ).toBe(true);
   });
 });

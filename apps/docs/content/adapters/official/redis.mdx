@@ -5,19 +5,16 @@ packageName: "@chat-adapter/state-redis"
 slug: redis
 type: state
 logo: redis
-tagline: Production state adapter for Chat SDK using the official `redis` client. Persistence, distributed locking, and caching out of the box.
-beta: true
-features:
-  persistence: yes
-  multiInstance: yes
-  subscriptions: yes
-  distributedLocking: yes
-  keyValueCache:
-    status: yes
-    label: TTL
-  automaticReconnect: yes
-  keyPrefix: yes
+tagline: Production state adapter for Chat SDK using the official `redis` client, with persistent subscriptions, distributed locking, and a key-value cache.
 ---
+
+## Create a new bot
+
+Scaffold a Next.js bot that stores state in Redis with [`create-chat-sdk`](/docs/create-chat-sdk). Replace `slack` with your platform adapter:
+
+<CreateChatSdk adapters="slack redis" />
+
+The CLI adds `@chat-adapter/state-redis`, wires `createRedisState()` into `src/lib/bot.ts`, and lists `REDIS_URL` in `.env.example`. To add the adapter to an existing app, start at [Install](#install).
 
 ## Install
 
@@ -25,9 +22,7 @@ features:
 
 ## Quick start
 
-<Callout type="info">
-The adapter auto-detects `REDIS_URL` from the environment.
-</Callout>
+With no options, `createRedisState()` connects to the URL in `REDIS_URL`.
 
 ```typescript title="lib/bot.ts" lineNumbers
 import { Chat } from "chat";
@@ -39,6 +34,33 @@ const bot = new Chat({
   state: createRedisState(),
 });
 ```
+
+If you already use ioredis or need Redis Sentinel, see [when to choose ioredis vs redis](/adapters/official/ioredis#when-to-choose-ioredis-vs-redis).
+
+## Vercel Marketplace
+
+Upstash Redis and Redis Cloud are both available on the [Vercel Marketplace](https://vercel.com/marketplace/category/storage). From your project directory, link the project and add an integration with the Vercel CLI. `vercel integration add` creates the database, connects it to the linked project, adds its credentials as environment variables, and pulls them into your local env file.
+
+<CodeBlockTabs defaultValue="upstash">
+  <CodeBlockTabsList>
+    <CodeBlockTabsTrigger value="upstash">Upstash Redis</CodeBlockTabsTrigger>
+    <CodeBlockTabsTrigger value="redis-cloud">Redis Cloud</CodeBlockTabsTrigger>
+  </CodeBlockTabsList>
+  <CodeBlockTab value="upstash">
+```bash
+vercel link
+vercel integration add upstash/upstash-kv
+```
+  </CodeBlockTab>
+  <CodeBlockTab value="redis-cloud">
+```bash
+vercel link
+vercel integration add redis
+```
+  </CodeBlockTab>
+</CodeBlockTabs>
+
+Upstash Redis adds `REDIS_URL` to your project, and `createRedisState()` reads it with no extra configuration. If your provider stores the connection URL under another name, pass that variable as `url`.
 
 ## Configuration
 
@@ -62,16 +84,22 @@ const bot = new Chat({
     logger: {
       type: "Logger",
       description:
-        "Logger instance. Defaults to `ConsoleLogger(\"info\")`.",
+        'Logger instance. Defaults to `ConsoleLogger("info").child("redis")`.',
     },
   }}
 />
 
 Either `url`, the `REDIS_URL` env var, or `client` is required.
 
-## Advanced
+### Environment variables
 
-### Using an existing client
+| Variable | Required | Description |
+| --- | --- | --- |
+| `REDIS_URL` | Unless `url` or `client` is set | Redis connection URL, used when `url` is not passed. |
+
+## Using an existing client
+
+Pass a client you created with the `redis` package as `client`. The adapter doesn't connect a client it didn't create, so call `client.connect()` yourself before the bot starts. The adapter's `disconnect()` leaves the client open.
 
 ```typescript title="lib/state.ts" lineNumbers
 import { createClient } from "redis";
@@ -83,9 +111,9 @@ await client.connect();
 export const state = createRedisState({ client });
 ```
 
-### Custom key prefix
+## Data model
 
-All keys are namespaced under `keyPrefix` (default: `"chat-sdk"`):
+Every key starts with `keyPrefix`, which defaults to `"chat-sdk"`. Set your own prefix to keep the bot's keys apart from other data in the same Redis database:
 
 ```typescript
 createRedisState({
@@ -94,21 +122,22 @@ createRedisState({
 });
 ```
 
-### Key structure
+| Key | Redis type | Contents |
+| --- | --- | --- |
+| `{keyPrefix}:subscriptions` | Set | Subscribed thread IDs |
+| `{keyPrefix}:lock:{threadId}` | String | Lock token, with a TTL |
+| `{keyPrefix}:cache:{key}` | String | JSON-serialized cache value, with an optional TTL |
+| `{keyPrefix}:list:{key}` | List | JSON-serialized list entries, with an optional TTL |
+| `{keyPrefix}:queue:{threadId}` | List | Queued messages for a thread, with a TTL |
 
-```
-{keyPrefix}:subscriptions     - SET of subscribed thread IDs
-{keyPrefix}:lock:{threadId}   - Lock key with TTL
-```
-
-### Production recommendations
+## Production notes
 
 - Run Redis 6.0+ for best performance.
 - Enable persistence (RDB or AOF).
-- Use Redis Cluster for high availability.
 - Set explicit memory limits.
+- For Redis Sentinel, use [`@chat-adapter/state-ioredis`](/adapters/official/ioredis). This adapter accepts a single `redis` client. Neither adapter supports Redis Cluster.
 
-For serverless deployments (Vercel, AWS Lambda), use a serverless-compatible Redis provider like [Upstash](https://upstash.com).
+For serverless deployments such as Vercel or AWS Lambda, use a serverless-compatible Redis provider. On Vercel, you can provision Upstash Redis or Redis Cloud from the [Vercel Marketplace](#vercel-marketplace).
 
 ## Feature support
 

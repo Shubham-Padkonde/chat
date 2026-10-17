@@ -1,6 +1,11 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { ADAPTERS } from "chat/adapters";
+import {
+  ADAPTERS,
+  type CatalogAdapter,
+  getCatalogEntry,
+  listAdapters,
+} from "@chat-adapter/catalog";
 import { describe, expect, it } from "vitest";
 import { DOCS_CONTENT_DIR, findDocsMdxFiles } from "./documentation-test-utils";
 
@@ -8,19 +13,19 @@ const ADAPTERS_DIR = join(DOCS_CONTENT_DIR, "adapters");
 const VENDOR_DIR = join(ADAPTERS_DIR, "vendor-official");
 const COMMUNITY_DIR = join(ADAPTERS_DIR, "community");
 const OFFICIAL_DIR = join(ADAPTERS_DIR, "official");
-const DOCS_DIR = join(DOCS_CONTENT_DIR, "..");
 
 const FRONTMATTER_BLOCK = /^---\r?\n([\s\S]*?)\r?\n---/;
 const FIELD_LINE = /^([a-zA-Z][a-zA-Z0-9_]*):\s*(.*)$/;
-const ICON_MAP_BLOCK =
-  /const (?:ICON_MAP|iconMap): Record<[\s\S]*?> = \{([\s\S]*?)\n\};/;
-const ICON_MAP_ENTRY = /^\s{2}(\w+),$/gm;
 const NEWLINE = /\r?\n/;
 const CHAT_ADAPTER_PACKAGE = /^@chat-adapter\//;
 const CHAT_STATE_ADAPTER_PACKAGE = /^@chat-adapter\/state-/;
-const OG_IMAGE_EXTENSION = /\.(png|jpe?g|webp)$/i;
 const PACKAGE_INSTALL_PATTERN = /<PackageInstall package="([^"]+)" \/>/g;
 const PACKAGE_INSTALL_PACKAGE_SEPARATOR = /\s+/;
+const FEATURES_FIELD = /^features:/m;
+const NAMED_IMPORT_PATTERN = /import\s*\{([^}]*)\}\s*from\s*["']([^"']+)["']/g;
+const IMPORT_SPECIFIER_SEPARATOR = /\s*,\s*/;
+const TYPE_IMPORT_PREFIX = /^type\s+/;
+const IMPORT_ALIAS = /\s+as\s+.*$/;
 
 interface Frontmatter {
   fields: Record<string, string>;
@@ -105,15 +110,6 @@ const packageInstallDeps = (adapter: AdapterFile): string[] => {
   return [...packageNames].sort();
 };
 
-const readIconMap = (filePath: string): Set<string> => {
-  const source = readFileSync(filePath, "utf-8");
-  const block = source.match(ICON_MAP_BLOCK)?.[1];
-  if (!block) {
-    throw new Error(`${filePath}: missing adapter icon map`);
-  }
-  return new Set([...block.matchAll(ICON_MAP_ENTRY)].map((match) => match[1]));
-};
-
 describe("Adapter MDX frontmatter", () => {
   const allAdapters = [
     ...loadAdapterMdx(OFFICIAL_DIR, "official"),
@@ -145,61 +141,26 @@ describe("Adapter MDX frontmatter", () => {
   }
 });
 
-describe("Official adapter logos", () => {
-  const officialAdapters = loadAdapterMdx(OFFICIAL_DIR, "official");
-  const cardIcons = readIconMap(
-    join(DOCS_DIR, "app/[lang]/adapters/components/adapter-card.tsx")
-  );
-  const heroIcons = readIconMap(
-    join(DOCS_DIR, "components/geistdocs/adapter-hero.tsx")
-  );
-
-  for (const adapter of officialAdapters) {
-    const logo = adapter.frontmatter.fields.logo;
-
-    it(`${adapter.slug} is registered on adapter cards`, () => {
-      expect(
-        logo,
-        `${adapter.fileName}: missing logo frontmatter`
-      ).toBeTruthy();
-      expect(
-        cardIcons.has(logo),
-        `${adapter.slug}: logo "${logo}" is missing from the adapter card icon map`
-      ).toBe(true);
-    });
-
-    it(`${adapter.slug} is registered in the adapter hero`, () => {
-      expect(
-        heroIcons.has(logo),
-        `${adapter.slug}: logo "${logo}" is missing from the adapter hero icon map`
-      ).toBe(true);
-    });
+const factoryImportSources = (
+  adapter: AdapterFile,
+  factoryExport: string
+): string[] => {
+  const sources: string[] = [];
+  for (const match of adapter.body.matchAll(NAMED_IMPORT_PATTERN)) {
+    const names = match[1]
+      .split(IMPORT_SPECIFIER_SEPARATOR)
+      .map((name) =>
+        name.trim().replace(TYPE_IMPORT_PREFIX, "").replace(IMPORT_ALIAS, "")
+      );
+    if (names.includes(factoryExport)) {
+      sources.push(match[2]);
+    }
   }
-});
+  return sources;
+};
 
 describe("Vendor-Official adapter MDX", () => {
   const vendorAdapters = loadAdapterMdx(VENDOR_DIR, "vendor-official");
-
-  it("contains exactly the expected adapters", () => {
-    expect(vendorAdapters.map((a) => a.slug).sort()).toEqual(
-      [
-        "agentphone",
-        "cloudflare-agents",
-        "dial",
-        "kapso",
-        "lark",
-        "linq",
-        "liveblocks",
-        "matrix",
-        "novu",
-        "photon",
-        "resend",
-        "sendblue",
-        "velt",
-        "zernio",
-      ].sort()
-    );
-  });
 
   for (const adapter of vendorAdapters) {
     describe(adapter.fileName, () => {
@@ -220,11 +181,37 @@ describe("Vendor-Official adapter MDX", () => {
         expect(adapter.body).toContain("<FeatureSupport />");
       });
 
+      it("imports factoryExport from the catalog import specifier", () => {
+        const catalogEntry = getCatalogEntry(adapter.slug) as
+          | CatalogAdapter
+          | undefined;
+        expect(
+          catalogEntry,
+          `${adapter.fileName}: missing @chat-adapter/catalog entry`
+        ).toBeDefined();
+        if (!catalogEntry) {
+          return;
+        }
+        const sources = factoryImportSources(
+          adapter,
+          catalogEntry.factoryExport
+        );
+        expect(
+          sources.length,
+          `${adapter.fileName}: no import of ${catalogEntry.factoryExport}`
+        ).toBeGreaterThan(0);
+        for (const source of sources) {
+          expect(source).toBe(
+            catalogEntry.importPath ?? catalogEntry.packageName
+          );
+        }
+      });
+
       it("keeps catalog peerDeps aligned with PackageInstall extras", () => {
         const catalogEntry = ADAPTERS[adapter.slug as keyof typeof ADAPTERS];
         expect(
           catalogEntry,
-          `${adapter.fileName}: missing chat/adapters catalog entry`
+          `${adapter.fileName}: missing @chat-adapter/catalog entry`
         ).toBeDefined();
         expect([...(catalogEntry?.peerDeps ?? [])].sort()).toEqual(
           packageInstallDeps(adapter)
@@ -279,127 +266,67 @@ describe("Official adapter MDX", () => {
   }
 });
 
-describe("Official platform adapter OG images", () => {
-  const OFFICIAL_PLATFORM_OG_DIR = join(OFFICIAL_DIR, "og");
-  const OG_IMAGE_EXTENSIONS = ["png", "jpg", "webp"] as const;
+describe("@chat-adapter/catalog parity", () => {
+  const adapterFiles = [
+    ...loadAdapterMdx(OFFICIAL_DIR, "official").map((adapter) => ({
+      adapter,
+      group: "official",
+    })),
+    ...loadAdapterMdx(VENDOR_DIR, "vendor-official").map((adapter) => ({
+      adapter,
+      group: "vendor-official",
+    })),
+    ...loadAdapterMdx(COMMUNITY_DIR, "community").map((adapter) => ({
+      adapter,
+      group: "community",
+    })),
+  ];
 
-  const hasOgImage = (slug: string): boolean =>
-    OG_IMAGE_EXTENSIONS.some((ext) =>
-      existsSync(join(OFFICIAL_PLATFORM_OG_DIR, `${slug}.${ext}`))
-    );
-
-  const platformAdapters = loadAdapterMdx(OFFICIAL_DIR, "official").filter(
-    (adapter) => adapter.frontmatter.fields.type === "platform"
-  );
-
-  it("contains the expected platform adapters", () => {
-    expect(platformAdapters.map((adapter) => adapter.slug).sort()).toEqual(
-      [
-        "discord",
-        "github",
-        "gchat",
-        "gmail",
-        "instagram",
-        "linear",
-        "messenger",
-        "notion",
-        "slack",
-        "teams",
-        "telegram",
-        "twilio",
-        "web",
-        "whatsapp",
-        "x",
-        "xchat",
-      ].sort()
-    );
+  it("lists exactly the adapters that have docs pages", () => {
+    expect(
+      listAdapters()
+        .map((entry) => entry.slug)
+        .sort()
+    ).toEqual(adapterFiles.map(({ adapter }) => adapter.slug).sort());
   });
 
-  for (const adapter of platformAdapters) {
-    it(`${adapter.slug} has a custom OG image`, () => {
-      expect(
-        hasOgImage(adapter.slug),
-        `${adapter.slug}: expected OG image at content/adapters/official/og/${adapter.slug}.{png,jpg,webp}`
-      ).toBe(true);
-    });
-  }
-
-  it("does not include OG images for unknown platform slugs", () => {
-    if (!existsSync(OFFICIAL_PLATFORM_OG_DIR)) {
-      return;
-    }
-
-    const platformSlugs = new Set(
-      platformAdapters.map((adapter) => adapter.slug)
-    );
-
-    for (const fileName of readdirSync(OFFICIAL_PLATFORM_OG_DIR)) {
-      const slug = fileName.replace(OG_IMAGE_EXTENSION, "");
-      expect(
-        platformSlugs.has(slug),
-        `Unexpected OG image "${fileName}" — no matching platform adapter`
-      ).toBe(true);
-    }
-  });
-});
-
-describe("adapters.json registry", () => {
-  const registry = JSON.parse(
-    readFileSync(join(DOCS_CONTENT_DIR, "..", "adapters.json"), "utf-8")
-  ) as Array<{
-    description: string;
-    name: string;
-    slug: string;
-    type: "platform" | "state";
-    packageName: string;
-    community?: boolean;
-    vendorOfficial?: boolean;
-    author?: string;
-  }>;
-
-  const vendorAdapters = loadAdapterMdx(VENDOR_DIR, "vendor-official");
-  const communityAdapters = loadAdapterMdx(COMMUNITY_DIR, "community");
-
-  it("matches the chat/adapters catalog", () => {
-    const catalogSlugs = Object.keys(ADAPTERS).sort();
-    const expectedSlugs = registry
-      .filter((entry) => !entry.community || entry.vendorOfficial)
-      .map((entry) => entry.slug)
-      .sort();
-
-    expect(catalogSlugs).toHaveLength(expectedSlugs.length);
-    expect(catalogSlugs).toEqual(expectedSlugs);
-  });
-
-  for (const adapter of [...vendorAdapters, ...communityAdapters]) {
+  for (const { adapter, group } of adapterFiles) {
     describe(adapter.fileName, () => {
-      const entry = registry.find((e) => e.slug === adapter.slug);
+      const entry = getCatalogEntry(adapter.slug);
 
-      it("has a matching adapters.json entry", () => {
+      it("has a catalog entry in the matching group", () => {
         expect(
           entry,
-          `${adapter.fileName}: no entry in adapters.json for slug "${adapter.slug}"`
+          `${adapter.fileName}: no @chat-adapter/catalog entry for slug "${adapter.slug}"`
         ).toBeDefined();
+        expect(entry?.group).toBe(group);
       });
 
-      it("packageName matches adapters.json", () => {
+      it("packageName matches the catalog", () => {
         expect(entry?.packageName).toBe(adapter.frontmatter.fields.packageName);
       });
 
-      it("type matches adapters.json", () => {
+      it("type matches the catalog", () => {
         expect(entry?.type).toBe(adapter.frontmatter.fields.type);
       });
 
-      it("vendorOfficial flag matches adapters.json", () => {
-        const inMdx = adapter.frontmatter.fields.vendorOfficial === "true";
-        const inRegistry = entry?.vendorOfficial === true;
-        expect(inMdx).toBe(inRegistry);
+      it("author matches the catalog", () => {
+        const author = adapter.frontmatter.fields.author;
+        if (group === "official") {
+          expect(author).toBeUndefined();
+          expect(entry?.author).toBeUndefined();
+          return;
+        }
+        if (group === "vendor-official") {
+          expect(author, `${adapter.fileName}: missing author`).toBeTruthy();
+        }
+        if (author) {
+          expect(entry?.author).toBe(author);
+        }
       });
 
-      it("community flag matches adapters.json", () => {
-        const inMdx = adapter.frontmatter.fields.community === "true";
-        const inRegistry = entry?.community === true;
-        expect(inMdx).toBe(inRegistry);
+      it("reads capabilities from the catalog, not frontmatter", () => {
+        expect(adapter.frontmatter.raw).not.toMatch(FEATURES_FIELD);
       });
     });
   }

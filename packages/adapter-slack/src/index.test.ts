@@ -736,6 +736,7 @@ describe("handleWebhook - interactive payloads", () => {
   const secret = "test-signing-secret";
   const adapter = createSlackAdapter({
     botToken: "xoxb-test-token",
+    botUserId: "U_BOT",
     signingSecret: secret,
     logger: mockLogger,
   });
@@ -841,6 +842,7 @@ describe("handleWebhook - interactive payloads", () => {
 
     const adapter = createSlackAdapter({
       botToken: "xoxb-test-token",
+      botUserId: "U_BOT",
       signingSecret: secret,
       logger: mockLogger,
     });
@@ -1042,6 +1044,7 @@ describe("handleWebhook - interactive payloads", () => {
       const chatInstance = createMockChatInstance({ state });
       const timeoutAdapter = createSlackAdapter({
         botToken: "xoxb-test-token",
+        botUserId: "U_BOT",
         logger: mockLogger,
         webhookVerifier: () => true,
       });
@@ -1155,6 +1158,54 @@ describe("parseMessage", () => {
     botUserId: "U_BOT",
   });
 
+  it.each([
+    [
+      "cost is 2 * 3 seats and 4 * 5 licenses",
+      "cost is 2 * 3 seats and 4 * 5 licenses",
+    ],
+    ["run `rm -rf *` then 5 * 3", "run rm -rf * then 5 * 3"],
+    ["mail <mailto:a*b*c@example.com|email>", "mail email"],
+    ["call <tel:+15551234567|555-123-4567>", "call 555-123-4567"],
+    ["mail <mailto:user@example.com>", "mail user@example.com"],
+  ])("preserves incoming mrkdwn through both parsing paths: %s", async (text, expected) => {
+    const event: SlackEvent = {
+      type: "message",
+      user: "U123",
+      username: "alice",
+      channel: "C456",
+      text,
+      ts: "1234567890.123456",
+    };
+    const internals = adapter as unknown as {
+      parseSlackMessage(
+        value: SlackEvent,
+        threadId: string
+      ): Promise<Message<unknown>>;
+    };
+    for (const message of [
+      adapter.parseMessage(event),
+      await internals.parseSlackMessage(event, "slack:C456:1234567890.123456"),
+    ]) {
+      expect(message.text).toBe(expected);
+      expect(message.threadId).toBe("slack:C456:1234567890.123456");
+      expect(message.isMention).toBe(false);
+      if (text.startsWith("mail ")) {
+        expect(message.formatted.children[0]).toMatchObject({
+          type: "paragraph",
+          children: [
+            { type: "text", value: "mail " },
+            {
+              type: "link",
+              url: text.includes("a*b*c")
+                ? "mailto:a*b*c@example.com"
+                : "mailto:user@example.com",
+            },
+          ],
+        });
+      }
+    }
+  });
+
   it("classifies the bot's mention without a user lookup", () => {
     const section = (element: Record<string, unknown>) => [
       {
@@ -1233,6 +1284,89 @@ describe("parseMessage", () => {
     expect(message.author.userId).toBe("U123");
     expect(message.author.isBot).toBe(false);
     expect(message.author.isMe).toBe(false);
+  });
+
+  it("converts special mentions to readable text", () => {
+    const message = adapter.parseMessage({
+      type: "message",
+      user: "U123",
+      channel: "C456",
+      text: "<!here> and <!subteam^S0123456789|@devs>",
+      ts: "1234567890.123456",
+    });
+
+    expect(message.text).toBe("@here and @devs");
+    expect(message.formatted.children.map((node) => node.type)).toEqual([
+      "paragraph",
+    ]);
+  });
+
+  it("preserves special mention tokens in an inbound inline code span", () => {
+    const text = "<!here> <!channel> <!everyone> <!subteam^S123>";
+    const message = adapter.parseMessage({
+      type: "message",
+      user: "U123",
+      channel: "D456",
+      channel_type: "im",
+      text: `review code \`${text}\``,
+      ts: "1234567890.123456",
+      blocks: [
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [
+                { type: "text", text: "review code " },
+                { type: "text", text, style: { code: true } },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(message.text).toBe(`review code ${text}`);
+    expect(message.formatted.children).toEqual([
+      expect.objectContaining({
+        type: "paragraph",
+        children: [
+          expect.objectContaining({ type: "text", value: "review code " }),
+          expect.objectContaining({ type: "inlineCode", value: text }),
+        ],
+      }),
+    ]);
+    expect(message.isMention).toBe(false);
+  });
+
+  it("preserves special mention tokens in an inbound code block", () => {
+    const text = "review fence <!here> <!channel> <!everyone>";
+    const message = adapter.parseMessage({
+      type: "message",
+      user: "U123",
+      channel: "D456",
+      channel_type: "im",
+      text: `\`\`\`${text}\`\`\``,
+      ts: "1234567890.123456",
+      blocks: [
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_preformatted",
+              elements: [{ type: "text", text }],
+              border: 0,
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(message.text).toBe(text);
+    expect(message.formatted.children).toEqual([
+      expect.objectContaining({ type: "code", value: text }),
+    ]);
+    expect(message.isMention).toBe(false);
   });
 
   it("parses a bot message", () => {
@@ -1626,7 +1760,7 @@ describe("parseMessage", () => {
     });
 
     // Cell tokens are rendered by the same mrkdwn converter as body text
-    expect(message.text).toBe("#C789 <!subteam^S789> July 11 #ff0000");
+    expect(message.text).toBe("#C789 @S789 July 11 #ff0000");
   });
 
   it("formats date cells from the timestamp when no fallback is present", () => {
@@ -4214,6 +4348,14 @@ describe("DM message handling", () => {
 
     mockClientMethod(
       adapter,
+      "conversations.info",
+      vi
+        .fn()
+        .mockResolvedValue({ ok: true, channel: { name: "archived-channel" } })
+    );
+
+    mockClientMethod(
+      adapter,
       "users.info",
       vi.fn().mockResolvedValue({
         ok: true,
@@ -6589,6 +6731,229 @@ describe("openDM", () => {
 
 describe("fetchMessages", () => {
   const secret = "test-signing-secret";
+
+  it.each([
+    { count: 425, pageSize: 200 },
+    { count: 1205, pageSize: 200 },
+    { count: 425, pageSize: 15 },
+  ])("fetches the newest replies in a $count-message thread with $pageSize-message API pages", async ({
+    count,
+    pageSize,
+  }) => {
+    const adapter = createSlackAdapter({
+      botToken: "xoxb-test-token",
+      signingSecret: secret,
+      logger: mockLogger,
+      botUserId: "U_BOT",
+    });
+    const history = Array.from({ length: count }, (_, index) => ({
+      type: "message",
+      user: "U1",
+      text: `message ${index}`,
+      ts: `${1000 + index}.000000`,
+      channel: "C123",
+    }));
+    // Slack replies are oldest-first, including when `latest` is supplied.
+    const mockReplies = vi.fn(
+      async (options: { latest?: string; cursor?: string; limit: number }) => {
+        const eligible = history.filter(
+          (message) => !options.latest || message.ts < options.latest
+        );
+        const offset = Number(options.cursor ?? 0);
+        const end = offset + Math.min(options.limit, pageSize);
+        return {
+          ok: true,
+          messages: eligible.slice(offset, end),
+          has_more: end < eligible.length,
+          response_metadata: {
+            next_cursor: end < eligible.length ? String(end) : "",
+          },
+        };
+      }
+    );
+    mockClientMethod(adapter, "conversations.replies", mockReplies);
+    mockClientMethod(
+      adapter,
+      "users.info",
+      vi.fn().mockResolvedValue({ ok: true, user: { name: "user1" } })
+    );
+    await adapter.initialize(
+      createMockChatInstance({ state: createMockState() })
+    );
+
+    const newest = await adapter.fetchMessages("slack:C123:1000.000000", {
+      limit: 50,
+    });
+    expect(newest.messages.map((message) => message.id)).toEqual(
+      history.slice(-50).map((message) => message.ts)
+    );
+    expect(newest.nextCursor).toBe(history[count - 50].ts);
+    expect(mockReplies).toHaveBeenCalledTimes(Math.ceil(count / pageSize));
+    expect(mockReplies).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cursor: String(pageSize),
+        latest: undefined,
+        limit: 1000,
+      })
+    );
+
+    mockReplies.mockClear();
+    const older = await adapter.fetchMessages("slack:C123:1000.000000", {
+      limit: 50,
+      cursor: newest.nextCursor,
+    });
+    expect(older.messages.map((message) => message.id)).toEqual(
+      history.slice(-100, -50).map((message) => message.ts)
+    );
+    expect(older.nextCursor).toBe(history[count - 100].ts);
+    expect(mockReplies).toHaveBeenCalledTimes(
+      Math.ceil((count - 50) / pageSize)
+    );
+
+    const oldest = await adapter.fetchMessages("slack:C123:1000.000000", {
+      limit: 50,
+      cursor: history[25].ts,
+    });
+    expect(oldest.messages.map((message) => message.id)).toEqual(
+      history.slice(0, 25).map((message) => message.ts)
+    );
+    expect(oldest.nextCursor).toBeUndefined();
+  });
+
+  it.each([
+    3, 5,
+  ])("keeps repeated thread parents unique and ordered with limit %i", async (limit) => {
+    const adapter = createSlackAdapter({
+      botToken: "xoxb-test-token",
+      signingSecret: secret,
+      logger: mockLogger,
+      botUserId: "U_BOT",
+    });
+    const history = Array.from({ length: 4 }, (_, index) => ({
+      type: "message",
+      user: "U1",
+      text: `message ${index}`,
+      ts: `${1000 + index}.000000`,
+    }));
+    const parent = history[0];
+    mockClientMethod(
+      adapter,
+      "conversations.replies",
+      vi.fn(async (options: { latest?: string; cursor?: string }) => {
+        const replies = history
+          .slice(1)
+          .filter((message) => !options.latest || message.ts < options.latest);
+        const offset = Number(options.cursor ?? 0);
+        const end = offset + 2;
+        return {
+          ok: true,
+          messages: [parent, ...replies.slice(offset, end)],
+          response_metadata: {
+            next_cursor: end < replies.length ? String(end) : "",
+          },
+        };
+      })
+    );
+    mockClientMethod(
+      adapter,
+      "users.info",
+      vi.fn().mockResolvedValue({ ok: true, user: { name: "user1" } })
+    );
+    await adapter.initialize(
+      createMockChatInstance({ state: createMockState() })
+    );
+
+    const newest = await adapter.fetchMessages("slack:C123:1000.000000", {
+      limit,
+    });
+    expect(newest.messages.map((message) => message.id)).toEqual(
+      history.slice(-limit).map((message) => message.ts)
+    );
+    expect(newest.nextCursor).toBe(limit === 3 ? history[1].ts : undefined);
+
+    const oldest = await adapter.fetchMessages("slack:C123:1000.000000", {
+      limit,
+      cursor: history[1].ts,
+    });
+    expect(oldest.messages.map((message) => message.id)).toEqual([parent.ts]);
+    expect(oldest.nextCursor).toBeUndefined();
+
+    const exhausted = await adapter.fetchMessages("slack:C123:1000.000000", {
+      limit,
+      cursor: parent.ts,
+    });
+    expect(exhausted.messages).toEqual([]);
+    expect(exhausted.nextCursor).toBeUndefined();
+  });
+
+  it("continues through an empty Slack page with a next cursor", async () => {
+    const adapter = createSlackAdapter({
+      botToken: "xoxb-test-token",
+      signingSecret: secret,
+      logger: mockLogger,
+      botUserId: "U_BOT",
+    });
+    const mockReplies = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        messages: [],
+        response_metadata: { next_cursor: "next-page" },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        messages: [
+          { type: "message", user: "U1", text: "newest", ts: "1000.000000" },
+        ],
+        response_metadata: { next_cursor: "" },
+      });
+    mockClientMethod(adapter, "conversations.replies", mockReplies);
+    mockClientMethod(
+      adapter,
+      "users.info",
+      vi.fn().mockResolvedValue({ ok: true, user: { name: "user1" } })
+    );
+    await adapter.initialize(
+      createMockChatInstance({ state: createMockState() })
+    );
+
+    const result = await adapter.fetchMessages("slack:C123:1000.000000");
+    expect(result.messages.map((message) => message.id)).toEqual([
+      "1000.000000",
+    ]);
+    expect(result.nextCursor).toBeUndefined();
+    expect(mockReplies).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ cursor: "next-page" })
+    );
+  });
+
+  it("rejects a failed later page instead of returning stale history", async () => {
+    const adapter = createSlackAdapter({
+      botToken: "xoxb-test-token",
+      signingSecret: secret,
+      logger: mockLogger,
+      botUserId: "U_BOT",
+    });
+    mockClientMethod(
+      adapter,
+      "conversations.replies",
+      vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          messages: [
+            { type: "message", user: "U1", text: "old", ts: "1000.000000" },
+          ],
+          response_metadata: { next_cursor: "next-page" },
+        })
+        .mockRejectedValueOnce(new Error("history unavailable"))
+    );
+
+    await expect(
+      adapter.fetchMessages("slack:C123:1000.000000")
+    ).rejects.toThrow("history unavailable");
+  });
 
   it("fetches messages in forward direction using cursor pagination", async () => {
     const adapter = createSlackAdapter({
@@ -10430,6 +10795,15 @@ describe("reverse user lookup", () => {
     it("marks messages from USLACK as isSystem", async () => {
       const { adapter } = createAdapterWithState();
 
+      mockClientMethod(
+        adapter,
+        "conversations.info",
+        vi.fn().mockResolvedValue({
+          ok: true,
+          channel: { name: "archived-channel" },
+        })
+      );
+
       const mockClient = (
         adapter as unknown as { _client: { users: { info: unknown } } }
       )._client;
@@ -10816,6 +11190,7 @@ describe("socket mode - initialize", () => {
 
     const state = createMockState();
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       mode: "socket",
       appToken: "xapp-test-token",
       botToken: "xoxb-test-token",
@@ -10847,6 +11222,7 @@ describe("socket mode - routeSocketEvent", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       mode: "socket",
       appToken: "xapp-test-token",
       botToken: "xoxb-test-token",
@@ -10889,7 +11265,13 @@ describe("socket mode - routeSocketEvent", () => {
   });
 
   it("dispatches slash_commands to processSlashCommand", async () => {
-    const { chatInstance, slackEventHandler } = await createSocketAdapter();
+    const { adapter, chatInstance, slackEventHandler } =
+      await createSocketAdapter();
+    mockClientMethod(
+      adapter,
+      "users.info",
+      vi.fn().mockResolvedValue({ ok: true, user: { name: "testuser" } })
+    );
 
     await slackEventHandler({
       ack: vi.fn().mockResolvedValue(undefined),
@@ -11031,6 +11413,7 @@ describe("socket mode - disconnect", () => {
 
     const state = createMockState();
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       mode: "socket",
       appToken: "xapp-test-token",
       botToken: "xoxb-test-token",
@@ -11067,6 +11450,7 @@ describe("socket mode forwarding - handleWebhook", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: secret,
       appToken,
@@ -11163,6 +11547,7 @@ describe("socket mode forwarding - handleWebhook", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: secret,
       appToken,
@@ -11294,6 +11679,7 @@ describe("socket mode forwarding - handleWebhook", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: secret,
       appToken,
@@ -11333,6 +11719,7 @@ describe("socket mode forwarding - handleWebhook", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: secret,
       appToken,
@@ -11437,6 +11824,7 @@ describe("routeSocketEvent with options", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       mode: "socket",
       appToken: "xapp-test-token",
       botToken: "xoxb-test-token",
@@ -11459,8 +11847,13 @@ describe("routeSocketEvent with options", () => {
   }
 
   it("dispatches slash_commands with waitUntil wrapping", async () => {
-    const { chatInstance, slackEventHandler } =
+    const { adapter, chatInstance, slackEventHandler } =
       await createSocketAdapterWithOptions();
+    mockClientMethod(
+      adapter,
+      "users.info",
+      vi.fn().mockResolvedValue({ ok: true, user: { name: "testuser" } })
+    );
 
     await slackEventHandler({
       ack: vi.fn().mockResolvedValue(undefined),
@@ -11482,12 +11875,18 @@ describe("routeSocketEvent with options", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: "test-secret",
       appToken: "xapp-test-token",
       logger: mockLogger,
     });
     await adapter.initialize(chatInstance);
+    mockClientMethod(
+      adapter,
+      "users.info",
+      vi.fn().mockResolvedValue({ ok: true, user: { name: "testuser" } })
+    );
 
     const body = JSON.stringify({
       type: "socket_event",
@@ -11522,6 +11921,7 @@ describe("routeSocketEvent with options", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: "test-secret",
       appToken: "xapp-test-token",
@@ -11792,7 +12192,31 @@ describe("native stream rotation", () => {
         token: TOKEN,
       });
       expect(segments[1].stop).toHaveBeenCalledWith({ token: TOKEN });
-      expect(result).toMatchObject({ id: "1234567890.1" });
+      expect(result).toMatchObject({
+        id: "1234567890.1",
+        messageIds: ["1234567890.0", "1234567890.1"],
+      });
+    });
+  });
+
+  it("returns the message IDs of every segment in order", async () => {
+    await withClock(async (tick) => {
+      const { adapter, chatStream } = setup();
+      async function* stream() {
+        yield "first\n";
+        tick(MAX_AGE + 1);
+        yield "second\n\nthird\n";
+        tick(2 * MAX_AGE + 2);
+        yield "fourth\n\nfifth\n";
+      }
+
+      const result = await adapter.stream(THREAD, stream());
+
+      expect(chatStream).toHaveBeenCalledTimes(3);
+      expect(result).toMatchObject({
+        id: "1234567890.2",
+        messageIds: ["1234567890.0", "1234567890.1", "1234567890.2"],
+      });
     });
   });
 
@@ -11837,7 +12261,10 @@ describe("native stream rotation", () => {
       expect(chatStream).toHaveBeenCalledTimes(1);
       expect(segments[0].stop).toHaveBeenCalledTimes(1);
       expect(segments[0].stop).toHaveBeenCalledWith({ token: TOKEN });
-      expect(result).toMatchObject({ id: "1234567890.0" });
+      expect(result).toMatchObject({
+        id: "1234567890.0",
+        messageIds: ["1234567890.0"],
+      });
     });
   });
 
@@ -11906,7 +12333,10 @@ describe("native stream rotation", () => {
         token: TOKEN,
         chunks: [],
       });
-      expect(result).toMatchObject({ id: "1234567890.1" });
+      expect(result).toMatchObject({
+        id: "1234567890.1",
+        messageIds: ["1234567890.0", "1234567890.1"],
+      });
       expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.stringContaining("expired before rotation"),
         expect.anything()
@@ -11932,7 +12362,10 @@ describe("native stream rotation", () => {
       token: TOKEN,
       markdown_text: "second\n",
     });
-    expect(result).toMatchObject({ id: "1234567890.1" });
+    expect(result).toMatchObject({
+      id: "1234567890.1",
+      messageIds: ["1234567890.0", "1234567890.1"],
+    });
   });
 
   it("returns the finalized message when the last segment expired with everything delivered", async () => {
@@ -11948,7 +12381,10 @@ describe("native stream rotation", () => {
 
     // No empty message is posted just to carry the feedback buttons.
     expect(chatStream).toHaveBeenCalledTimes(1);
-    expect(result).toMatchObject({ id: "1234567890.0" });
+    expect(result).toMatchObject({
+      id: "1234567890.0",
+      messageIds: ["1234567890.0"],
+    });
     expect(mockLogger.warn).toHaveBeenCalledWith(
       expect.stringContaining("stream-end blocks skipped"),
       expect.objectContaining({ skippedBlocks: 1 })
@@ -11971,7 +12407,7 @@ describe("native stream rotation", () => {
     });
   });
 
-  it("replays the plan and open task cards into the new segment", async () => {
+  it("completes open task cards before replaying them into the new segment", async () => {
     await withClock(async (tick) => {
       const { adapter, segments } = setup();
       const plan = { type: "plan_update" as const, title: "Plan" };
@@ -11999,7 +12435,10 @@ describe("native stream rotation", () => {
 
       await adapter.stream(THREAD, stream());
 
-      expect(segments[0].stop).toHaveBeenCalledWith({ token: TOKEN });
+      expect(segments[0].stop).toHaveBeenCalledWith({
+        chunks: [{ ...oneInProgress, status: "complete" }],
+        token: TOKEN,
+      });
       expect(segments[1].append).toHaveBeenNthCalledWith(1, {
         chunks: [plan, oneInProgress],
         token: TOKEN,
@@ -12008,6 +12447,110 @@ describe("native stream rotation", () => {
         chunks: [oneComplete],
         token: TOKEN,
       });
+    });
+  });
+
+  it("retries the rotation stop without task chunks when Slack rejects them", async () => {
+    await withClock(async (tick) => {
+      const { adapter, segments } = setup();
+      const task = {
+        type: "task_update" as const,
+        id: "t1",
+        title: "One",
+        status: "in_progress" as const,
+      };
+      segments[0].stop.mockRejectedValueOnce(
+        Object.assign(new Error("invalid_chunks"), {
+          code: "slack_webapi_platform_error",
+          data: { error: "invalid_chunks" },
+        })
+      );
+      async function* stream() {
+        yield task;
+        yield "first\n";
+        tick(MAX_AGE + 1);
+        yield "second\n\nthird\n";
+        yield { ...task, status: "complete" as const };
+      }
+
+      const result = await adapter.stream(THREAD, stream());
+
+      expect(segments[0].stop).toHaveBeenCalledTimes(2);
+      expect(segments[0].stop).toHaveBeenNthCalledWith(1, {
+        chunks: [{ ...task, status: "complete" }],
+        markdown_text: "second\n\n",
+        token: TOKEN,
+      });
+      // The streamer kept the text from the rejected call, so the retry
+      // must not send it again.
+      expect(segments[0].stop.mock.calls[1][0]).toStrictEqual({
+        token: TOKEN,
+      });
+      // Structured chunks are off for the rest of the stream.
+      expect(segments[1].append).not.toHaveBeenCalledWith(
+        expect.objectContaining({ chunks: expect.arrayContaining([task]) })
+      );
+      expect(result).toMatchObject({
+        id: "1234567890.1",
+        messageIds: ["1234567890.0", "1234567890.1"],
+      });
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("Structured streaming chunk failed"),
+        expect.objectContaining({ chunkType: "task_update" })
+      );
+    });
+  });
+
+  it("does not retry the rotation stop after an error Slack may have applied", async () => {
+    await withClock(async (tick) => {
+      const { adapter, segments } = setup();
+      const task = {
+        type: "task_update" as const,
+        id: "t1",
+        title: "One",
+        status: "in_progress" as const,
+      };
+      segments[0].stop.mockRejectedValueOnce(
+        Object.assign(new Error("internal_error"), {
+          code: "slack_webapi_platform_error",
+          data: { error: "internal_error" },
+        })
+      );
+      async function* stream() {
+        yield task;
+        yield "first\n";
+        tick(MAX_AGE + 1);
+        yield "second\n\nthird\n";
+      }
+
+      await expect(adapter.stream(THREAD, stream())).rejects.toThrow(
+        "internal_error"
+      );
+      expect(segments[0].stop).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("does not retry the rotation stop after a transport error", async () => {
+    await withClock(async (tick) => {
+      const { adapter, segments } = setup();
+      const task = {
+        type: "task_update" as const,
+        id: "t1",
+        title: "One",
+        status: "in_progress" as const,
+      };
+      segments[0].stop.mockRejectedValueOnce(new Error("socket hang up"));
+      async function* stream() {
+        yield task;
+        yield "first\n";
+        tick(MAX_AGE + 1);
+        yield "second\n\nthird\n";
+      }
+
+      await expect(adapter.stream(THREAD, stream())).rejects.toThrow(
+        "socket hang up"
+      );
+      expect(segments[0].stop).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -12262,7 +12805,10 @@ describe("native streaming fallback", () => {
 
     expect(postSpy).toHaveBeenCalledTimes(1);
     expect(stop).not.toHaveBeenCalled();
-    expect(result).toMatchObject({ id: "fallback-ts" });
+    expect(result).toMatchObject({
+      id: "fallback-ts",
+      messageIds: ["fallback-ts"],
+    });
     // Whatever the throttle did mid-stream, the final forced flush must have
     // delivered the full text — via the initial post or a closing edit.
     const lastPosted = editSpy.mock.calls.length
@@ -12668,6 +13214,7 @@ describe("feedbackButtons", () => {
 
   it("routes feedback button clicks through onAction", async () => {
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: "test-signing-secret",
       logger: mockLogger,
@@ -12771,6 +13318,7 @@ describe("getUser", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: "test-secret",
       logger: mockLogger,
@@ -12810,6 +13358,7 @@ describe("getUser", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: "test-secret",
       logger: mockLogger,
@@ -12830,6 +13379,7 @@ describe("getUser", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: "test-secret",
       logger: mockLogger,
@@ -12850,6 +13400,7 @@ describe("getUser", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: "test-secret",
       logger: mockLogger,
@@ -12883,6 +13434,7 @@ describe("getUser", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: "test-secret",
       logger: mockLogger,
@@ -12918,6 +13470,7 @@ describe("getUser", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: "test-secret",
       logger: mockLogger,
@@ -12948,6 +13501,7 @@ describe("getUser", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: "test-secret",
       logger: mockLogger,
@@ -12980,11 +13534,17 @@ describe("link unfurl enrichment", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: secret,
       logger: mockLogger,
     });
     await adapter.initialize(chatInstance);
+    mockClientMethod(
+      adapter,
+      "users.info",
+      vi.fn().mockResolvedValue({ ok: true, user: { name: "testuser" } })
+    );
 
     const body = JSON.stringify({
       type: "event_callback",
@@ -13050,11 +13610,17 @@ describe("link unfurl enrichment", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: secret,
       logger: mockLogger,
     });
     await adapter.initialize(chatInstance);
+    mockClientMethod(
+      adapter,
+      "users.info",
+      vi.fn().mockResolvedValue({ ok: true, user: { name: "testuser" } })
+    );
 
     const body = JSON.stringify({
       type: "event_callback",
@@ -13094,11 +13660,17 @@ describe("link unfurl enrichment", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: secret,
       logger: mockLogger,
     });
     await adapter.initialize(chatInstance);
+    mockClientMethod(
+      adapter,
+      "users.info",
+      vi.fn().mockResolvedValue({ ok: true, user: { name: "testuser" } })
+    );
 
     const body = JSON.stringify({
       type: "event_callback",
@@ -13140,11 +13712,17 @@ describe("link unfurl enrichment", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: secret,
       logger: mockLogger,
     });
     await adapter.initialize(chatInstance);
+    mockClientMethod(
+      adapter,
+      "users.info",
+      vi.fn().mockResolvedValue({ ok: true, user: { name: "testuser" } })
+    );
 
     const overLong = `https://example.com/${"a".repeat(4000)}`;
     const body = JSON.stringify({
@@ -13176,11 +13754,17 @@ describe("link unfurl enrichment", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: secret,
       logger: mockLogger,
     });
     await adapter.initialize(chatInstance);
+    mockClientMethod(
+      adapter,
+      "users.info",
+      vi.fn().mockResolvedValue({ ok: true, user: { name: "testuser" } })
+    );
 
     const body = JSON.stringify({
       type: "event_callback",
@@ -13610,6 +14194,7 @@ describe("installation-scoped caches", () => {
   it("uses unscoped keys without a request context (single-workspace)", async () => {
     const state = createMockState();
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-single-token",
       signingSecret: "test-signing-secret",
       logger: mockLogger,
@@ -13966,6 +14551,7 @@ describe("event delivery deduplication", () => {
     const state = createMockState();
     const chatInstance = createMockChatInstance({ state });
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: secret,
       logger: mockLogger,
@@ -14076,6 +14662,7 @@ describe("W-prefixed enterprise user IDs", () => {
   async function createWAdapter() {
     const state = createMockState();
     const adapter = createSlackAdapter({
+      botUserId: "U_BOT",
       botToken: "xoxb-test-token",
       signingSecret: "test-signing-secret",
       logger: mockLogger,

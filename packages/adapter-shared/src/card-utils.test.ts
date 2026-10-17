@@ -10,10 +10,10 @@ import {
   Field,
   Fields,
   Table,
+  TextInput,
 } from "chat";
 import { describe, expect, it } from "vitest";
 import {
-  BUTTON_STYLE_MAPPINGS,
   cardToFallbackText,
   createEmojiConverter,
   escapeTableCell,
@@ -91,22 +91,16 @@ describe("mapButtonStyle", () => {
   });
 });
 
-describe("BUTTON_STYLE_MAPPINGS", () => {
-  it("has mappings for all platforms", () => {
-    expect(BUTTON_STYLE_MAPPINGS.slack).toBeDefined();
-    expect(BUTTON_STYLE_MAPPINGS.teams).toBeDefined();
-    expect(BUTTON_STYLE_MAPPINGS.gchat).toBeDefined();
-  });
-
-  it("has primary and danger for each platform", () => {
-    for (const platform of ["slack", "teams", "gchat"] as const) {
-      expect(BUTTON_STYLE_MAPPINGS[platform].primary).toBeDefined();
-      expect(BUTTON_STYLE_MAPPINGS[platform].danger).toBeDefined();
-    }
-  });
-});
-
 describe("cardToFallbackText", () => {
+  it("converts emoji in a text input's label", () => {
+    const card = Card({
+      children: [TextInput({ id: "notes", label: "{{emoji:memo}} Notes" })],
+    });
+    expect(cardToFallbackText(card, { platform: "slack" })).toBe(
+      ":memo: Notes"
+    );
+  });
+
   it("formats title with bold", () => {
     const card = Card({ title: "Test Title" });
     expect(cardToFallbackText(card)).toBe("*Test Title*");
